@@ -1,0 +1,162 @@
+<?php
+
+class KodboxElasticClient {
+	private $url;
+	private $index;
+	private $pipeline = 'kodbox-attachment';
+	private $verifyTls;
+
+	public function __construct($config) {
+		$this->url = rtrim(_get($config, 'elasticUrl', 'http://elasticsearch:9200'), '/');
+		$this->index = strtolower(_get($config, 'indexName', 'kodbox-fulltext'));
+		$this->verifyTls = _get($config, 'verifyTls', '1') == '1';
+	}
+
+	public function info() {return $this->request('GET', '/');}
+
+	public function ensureInfrastructure() {
+		$this->request('PUT', '/_ingest/pipeline/'.$this->pipeline, array(
+			'description' => 'Extract PDF and Office text for Kodbox',
+			'processors' => array(
+				array('attachment' => array('field' => 'data', 'target_field' => 'attachment', 'indexed_chars' => -1, 'remove_binary' => true)),
+				array('convert' => array('field' => 'attachment.content', 'target_field' => 'content', 'type' => 'string', 'ignore_failure' => true)),
+				array('remove' => array('field' => 'attachment', 'ignore_missing' => true)),
+			),
+		));
+		$exists = $this->request('HEAD', '/'.$this->index, null, array(200, 404));
+		if ($exists['_status'] === 404) {
+			$this->request('PUT', '/'.$this->index, array(
+				'settings' => array('number_of_shards' => 1, 'number_of_replicas' => 0),
+				'mappings' => array(
+					'dynamic' => false,
+					'properties' => array(
+						'fileID' => array('type' => 'long'), 'sourceID' => array('type' => 'long'),
+						'name' => array('type' => 'text'), 'ext' => array('type' => 'keyword'),
+						'size' => array('type' => 'long'), 'modifyTime' => array('type' => 'date', 'format' => 'epoch_second'),
+						'content' => array('type' => 'text'),
+					),
+				),
+			));
+		}
+		return true;
+	}
+
+	public function indexFile($source, $content, $plainText) {
+		$document = array(
+			'fileID' => intval($source['fileID']), 'sourceID' => intval($source['sourceID']),
+			'name' => (string)$source['name'], 'ext' => strtolower((string)$source['fileType']),
+			'size' => intval($source['size']), 'modifyTime' => intval($source['modifyTime']),
+		);
+		$path = '/'.$this->index.'/_doc/'.intval($source['fileID']).'?refresh=false';
+		if ($plainText) $document['content'] = $this->toUtf8($content);
+		else {
+			$document['data'] = base64_encode($content);
+			$path .= '&pipeline='.$this->pipeline;
+		}
+		return $this->request('PUT', $path, $document);
+	}
+
+	public function search($words, $limit) {
+		$body = array(
+			'size' => max(1, intval($limit)),
+			'_source' => array('fileID', 'ext'),
+			// “文件内容”搜索只匹配正文，与官方 docSearch 的 MATCH(content) 行为一致。
+			'query' => array('bool' => array(
+				'should' => array(
+					array('match_phrase' => array('content' => array('query' => (string)$words, 'boost' => 3))),
+					array('match' => array('content' => array('query' => (string)$words, 'operator' => 'and'))),
+				),
+				'minimum_should_match' => 1,
+			)),
+			'highlight' => array(
+				'encoder' => 'html',
+				'require_field_match' => true,
+				'pre_tags' => array(''),
+				'post_tags' => array(''),
+				'fields' => array('content' => array('fragment_size' => 300, 'number_of_fragments' => 1, 'no_match_size' => 0)),
+			),
+		);
+		$response = $this->request('POST', '/'.$this->index.'/_search', $body);
+		$result = array();
+		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
+			$source = (array)_get($hit, '_source', array());
+			$highlight = (array)_get($hit, 'highlight', array());
+			$result[] = array(
+				'fileID' => intval(_get($source, 'fileID', _get($hit, '_id', 0))),
+				'ext' => strtolower((string)_get($source, 'ext', '')),
+				'snippet' => !empty($highlight['content'][0]) ? $highlight['content'][0] : '',
+			);
+		}
+		return $result;
+	}
+
+	public function getContent($fileID) {
+		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content', null, array(200, 404));
+		if ($result['_status'] === 404) return '';
+		return (string)_get($result, 'content', '');
+	}
+
+	public function getContents($fileIDs) {
+		$ids = array();
+		foreach ((array)$fileIDs as $fileID) {
+			$fileID = intval($fileID);
+			if ($fileID) $ids[] = (string)$fileID;
+		}
+		$ids = array_values(array_unique($ids));
+		if (!$ids) return array();
+		$response = $this->request('POST', '/'.$this->index.'/_mget?_source=content,fileID', array('ids' => $ids));
+		$map = array();
+		foreach ((array)_get($response, 'docs', array()) as $doc) {
+			if (!_get($doc, 'found')) continue;
+			$source = (array)_get($doc, '_source', array());
+			$fileID = intval(_get($source, 'fileID', _get($doc, '_id', 0)));
+			if ($fileID) $map[$fileID] = (string)_get($source, 'content', '');
+		}
+		return $map;
+	}
+
+	public function deleteFile($fileID) {$this->request('DELETE', '/'.$this->index.'/_doc/'.intval($fileID), null, array(200, 404));}
+
+	public function count() {
+		$result = $this->request('GET', '/'.$this->index.'/_count', null, array(200, 404));
+		return intval(_get($result, 'count', 0));
+	}
+
+	public function rebuild() {
+		$this->request('DELETE', '/'.$this->index, null, array(200, 404));
+		return $this->ensureInfrastructure();
+	}
+
+	private function request($method, $path, $body = null, $allowed = array(200, 201)) {
+		if (!function_exists('curl_init')) throw new Exception('PHP cURL extension is required');
+		$curl = curl_init($this->url.$path);
+		$options = array(
+			CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_CONNECTTIMEOUT => 5, CURLOPT_TIMEOUT => 120,
+			CURLOPT_HTTPHEADER => array('Content-Type: application/json'),
+			CURLOPT_SSL_VERIFYPEER => $this->verifyTls, CURLOPT_SSL_VERIFYHOST => $this->verifyTls ? 2 : 0,
+		);
+		if ($method === 'HEAD') $options[CURLOPT_NOBODY] = true;
+		if ($body !== null && $method !== 'HEAD') $options[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+		curl_setopt_array($curl, $options);
+		$response = curl_exec($curl);
+		if ($response === false) {$error = curl_error($curl); curl_close($curl); throw new Exception('Elasticsearch connection failed: '.$error);}
+		$status = intval(curl_getinfo($curl, CURLINFO_HTTP_CODE));
+		curl_close($curl);
+		$data = $response === '' ? array() : json_decode($response, true);
+		if (!is_array($data)) $data = array('_raw' => $response);
+		$data['_status'] = $status;
+		if (!in_array($status, $allowed, true)) {
+			$reason = _get(_get(_get($data, 'error', array()), 'root_cause', array()), 0, array());
+			$message = is_array($reason) ? _get($reason, 'reason', '') : '';
+			if (!$message) $message = is_array(_get($data, 'error', null)) ? json_encode(_get($data, 'error', array()), JSON_UNESCAPED_UNICODE) : _get($data, 'error', $response);
+			throw new Exception('Elasticsearch HTTP '.$status.': '.substr((string)$message, 0, 800));
+		}
+		return $data;
+	}
+
+	private function toUtf8($content) {
+		if (!function_exists('mb_check_encoding') || mb_check_encoding($content, 'UTF-8')) return $content;
+		return mb_convert_encoding($content, 'UTF-8', 'UTF-8,GB18030,GBK,BIG5,ISO-8859-1');
+	}
+}
