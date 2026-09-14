@@ -12,7 +12,7 @@ class KodboxElasticClient {
 		$this->verifyTls = _get($config, 'verifyTls', '1') == '1';
 	}
 
-	public function info() {return $this->request('GET', '/');}
+	public function info($timeout = 5) {return $this->request('GET', '/', null, array(200), $timeout);}
 
 	public function ensureInfrastructure() {
 		$this->request('PUT', '/_ingest/pipeline/'.$this->pipeline, array(
@@ -59,7 +59,7 @@ class KodboxElasticClient {
 	public function search($words, $limit) {
 		$body = array(
 			'size' => max(1, intval($limit)),
-			'_source' => array('fileID', 'ext'),
+			'_source' => array('fileID'),
 			// “文件内容”搜索只匹配正文，与官方 docSearch 的 MATCH(content) 行为一致。
 			'query' => array('bool' => array(
 				'should' => array(
@@ -69,11 +69,8 @@ class KodboxElasticClient {
 				'minimum_should_match' => 1,
 			)),
 			'highlight' => array(
-				'encoder' => 'html',
-				'require_field_match' => true,
-				'pre_tags' => array(''),
-				'post_tags' => array(''),
-				'fields' => array('content' => array('fragment_size' => 300, 'number_of_fragments' => 1, 'no_match_size' => 0)),
+				'pre_tags' => array(''), 'post_tags' => array(''),
+				'fields' => array('content' => array('fragment_size' => 260, 'number_of_fragments' => 1), 'name' => array('number_of_fragments' => 0)),
 			),
 		);
 		$response = $this->request('POST', '/'.$this->index.'/_search', $body);
@@ -81,11 +78,10 @@ class KodboxElasticClient {
 		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
 			$source = (array)_get($hit, '_source', array());
 			$highlight = (array)_get($hit, 'highlight', array());
-			$result[] = array(
-				'fileID' => intval(_get($source, 'fileID', _get($hit, '_id', 0))),
-				'ext' => strtolower((string)_get($source, 'ext', '')),
-				'snippet' => !empty($highlight['content'][0]) ? $highlight['content'][0] : '',
-			);
+			$snippet = '';
+			if (!empty($highlight['content'][0])) $snippet = $highlight['content'][0];
+			else if (!empty($highlight['name'][0])) $snippet = $highlight['name'][0];
+			$result[] = array('fileID' => intval(_get($source, 'fileID', _get($hit, '_id', 0))), 'snippet' => $snippet);
 		}
 		return $result;
 	}
@@ -94,25 +90,6 @@ class KodboxElasticClient {
 		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content', null, array(200, 404));
 		if ($result['_status'] === 404) return '';
 		return (string)_get($result, 'content', '');
-	}
-
-	public function getContents($fileIDs) {
-		$ids = array();
-		foreach ((array)$fileIDs as $fileID) {
-			$fileID = intval($fileID);
-			if ($fileID) $ids[] = (string)$fileID;
-		}
-		$ids = array_values(array_unique($ids));
-		if (!$ids) return array();
-		$response = $this->request('POST', '/'.$this->index.'/_mget?_source=content,fileID', array('ids' => $ids));
-		$map = array();
-		foreach ((array)_get($response, 'docs', array()) as $doc) {
-			if (!_get($doc, 'found')) continue;
-			$source = (array)_get($doc, '_source', array());
-			$fileID = intval(_get($source, 'fileID', _get($doc, '_id', 0)));
-			if ($fileID) $map[$fileID] = (string)_get($source, 'content', '');
-		}
-		return $map;
 	}
 
 	public function deleteFile($fileID) {$this->request('DELETE', '/'.$this->index.'/_doc/'.intval($fileID), null, array(200, 404));}
@@ -127,12 +104,12 @@ class KodboxElasticClient {
 		return $this->ensureInfrastructure();
 	}
 
-	private function request($method, $path, $body = null, $allowed = array(200, 201)) {
+	private function request($method, $path, $body = null, $allowed = array(200, 201), $timeout = 120) {
 		if (!function_exists('curl_init')) throw new Exception('PHP cURL extension is required');
 		$curl = curl_init($this->url.$path);
 		$options = array(
 			CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => true,
-			CURLOPT_CONNECTTIMEOUT => 5, CURLOPT_TIMEOUT => 120,
+			CURLOPT_CONNECTTIMEOUT => min(5, max(1, intval($timeout))), CURLOPT_TIMEOUT => max(1, intval($timeout)),
 			CURLOPT_HTTPHEADER => array('Content-Type: application/json'),
 			CURLOPT_SSL_VERIFYPEER => $this->verifyTls, CURLOPT_SSL_VERIFYHOST => $this->verifyTls ? 2 : 0,
 		);

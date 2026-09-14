@@ -2,6 +2,8 @@
 
 为 Kodbox 提供 PDF、Office 与文本文件的全文搜索。设计参考 Nextcloud Full Text Search 的分层方式，但代码为独立实现：Kodbox 管理文件、目录与访问权限，Elasticsearch `ingest-attachment`（Apache Tika）负责内容提取和检索。
 
+当前版本：`1.3.2`
+
 已验证环境：
 
 - Kodbox `1.69.03`
@@ -17,6 +19,10 @@
 - 直接接管 Kodbox 原生“文件内容”搜索；ES 只返回 `fileID` 候选，最终结果仍由 Kodbox 核心按当前目录和用户权限过滤。
 - 对 Kodbox 返回结果再次执行严格的 `fileID` 交集过滤，避免当前目录中的无关文件混入结果。
 - 管理页提供连接测试、立即执行一批、重建索引和状态统计。
+- 管理页参照官方 `docSearch` 分为基础设置和其他设置；服务状态异步检测，不阻塞配置读取或保存。
+- 启停和保存仅更新本地状态与计划任务，不同步连接 Elasticsearch。
+- 后台任务使用进程锁避免重叠执行，并在扫描新文件前优先重试失败文件。
+- 支持“允许格式”和“禁止格式”两种格式策略。
 
 ## 支持的格式
 
@@ -182,7 +188,6 @@ elasticFulltext/
 │   └── en.php
 └── static/
     ├── admin.js
-    ├── main.js
     └── icon.svg
 ```
 
@@ -199,12 +204,6 @@ php -r 'json_decode(file_get_contents("package.json"), true, 512, JSON_THROW_ON_
 本项目不是 Kodbox 官方插件，也不包含 Nextcloud 插件源码。
 
 ## 版本记录
-
-### 1.2.0
-
-- 摘要改为纯文本，避免 HTML 破坏列表 DOM。
-- 文本文件使用与 `docSearch` 相同的 `searchTextFile` 按行命中展示。
-- PDF/Office 仍使用 `searchContentMatch`，并去掉没有真实封面图时重复的类型图标。
 
 ### 1.1.0
 

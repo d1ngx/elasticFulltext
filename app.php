@@ -30,18 +30,14 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function onChangeStatus($status) {
-		if ($status) {
-			$this->initTable();
-			try {$this->client()->ensureInfrastructure();} catch (Throwable $e) {$this->log($e->getMessage());}
-		}
-		$this->updateTask($status ? 1 : 0);
-		$this->restartTaskRunner();
+		if ($status) $this->initTable();
+		$this->updateTask($status && $this->isOpen() ? 1 : 0);
+		return true;
 	}
 
 	public function onUpdate() {
 		$this->initTable();
-		$this->updateTask(1);
-		$this->restartTaskRunner();
+		$this->updateTask($this->isOpen() ? 1 : 0);
 	}
 
 	public function onSetConfig($config) {
@@ -51,18 +47,17 @@ class elasticFulltextPlugin extends PluginBase {
 		if (!$config['indexName'] || $config['indexName'][0] === '_' || $config['indexName'][0] === '-') throw new Exception('Invalid Elasticsearch index name');
 		$config['maxFileSizeMB'] = max(1, min(500, intval(_get($config, 'maxFileSizeMB', 50))));
 		$config['batchSize'] = max(1, min(200, intval(_get($config, 'batchSize', 20))));
-		$config['searchLimit'] = max(10, min(5000, intval(_get($config, 'searchLimit', 1000))));
-		$config['verifyTls'] = _get($config, 'verifyTls', '1') == '1' ? 1 : 0;
+		$config['serviceEnabled'] = _get($config, 'serviceEnabled', '1') == '1' ? 1 : 0;
+		$config['extensionMode'] = _get($config, 'extensionMode', 'allow') === 'deny' ? 'deny' : 'allow';
 		$config['allowExtensions'] = implode(',', $this->normalizeExtensions(_get($config, 'allowExtensions', '')));
+		$config['denyExtensions'] = implode(',', $this->normalizeExtensions(_get($config, 'denyExtensions', '')));
+		unset($config['pluginAuth'], $config['searchLimit'], $config['verifyTls'], $config['serviceCheck'], $config['runStatus'], $config['statusPanel'], $config['actions']);
 		$this->initTable();
-		$this->client($config)->ensureInfrastructure();
-		$this->updateTask(1);
-		$this->restartTaskRunner();
+		$this->updateTask($config['serviceEnabled']);
 		return $config;
 	}
 
 	public function onGetConfig($formData) {
-		if (isset($formData['statusPanel'])) $formData['statusPanel']['value'] = $this->statusHtml();
 		return $formData;
 	}
 
@@ -72,10 +67,11 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function searchBefore($param) {
+		if (!$this->isOpen()) return $param;
 		if (!is_array($param) || empty($param['words']) || !in_array('content', (array)_get($param, 'option', array()), true)) return $param;
 		if (strlen($param['words']) <= 1 || empty($param['parentID'])) return $param;
 		try {
-			$result = $this->client()->search($param['words'], intval(_get($this->getConfig(), 'searchLimit', 1000)));
+			$result = $this->client()->search($param['words'], 1000);
 			$fileIDs = array();
 			$this->snippets = array();
 			$this->matchedFileIDs = array();
@@ -99,46 +95,12 @@ class elasticFulltextPlugin extends PluginBase {
 	public function searchAfter($param, $listData) {
 		if (empty($param['_elasticFulltext']) || !is_array($listData)) return $listData;
 		if (!isset($listData['fileList']) || !is_array($listData['fileList'])) return $listData;
-		$words = (string)_get($param, 'words', '');
 		$filtered = array();
-		$textFileIDs = array();
 		foreach ($listData['fileList'] as $item) {
 			$fileID = intval(_get($item, 'fileID', 0));
 			if (!$fileID || !isset($this->matchedFileIDs[$fileID])) continue;
+			if (isset($this->snippets[$fileID])) $item['searchContentMatch'] = $this->snippets[$fileID];
 			$filtered[] = $item;
-			if (is_text_file(_get($item, 'ext', ''))) $textFileIDs[] = $fileID;
-		}
-		$contents = array();
-		if ($textFileIDs) {
-			try {$contents = $this->client()->getContents(array_slice($textFileIDs, 0, 80));}
-			catch (Throwable $e) {$this->log('mget content failed: '.$e->getMessage());}
-		}
-		$listSearch = Action('explorer.listSearch');
-		$officeFallback = 0;
-		foreach ($filtered as $key => $file) {
-			$fileID = intval($file['fileID']);
-			$ext = _get($file, 'ext', '');
-			$snippet = isset($this->snippets[$fileID]) ? $this->snippets[$fileID] : '';
-			if (is_text_file($ext)) {
-				$content = isset($contents[$fileID]) ? trim(str_replace("\0", '', $contents[$fileID]), " \t\r\n\f") : '';
-				if ($content !== '') {
-					$find = content_search($content, $words, false, 105, true);
-					if ($find) $file['searchTextFile'] = $find;
-					else $file['searchContentMatch'] = $snippet !== '' ? $snippet : mb_substr($content, 0, 300);
-				} else if ($snippet !== '') {
-					$file['searchContentMatch'] = $snippet;
-				}
-			} else if ($snippet !== '') {
-				$file['searchContentMatch'] = $snippet;
-			} else if ($officeFallback < 10) {
-				$officeFallback++;
-				$content = $this->safeFileContent($fileID);
-				if ($content !== '') {
-					$find = $listSearch->contentSearchMatch($content, $words);
-					$file['searchContentMatch'] = $find ? $this->sanitizeSnippet($find) : mb_substr($content, 0, 300);
-				}
-			}
-			$filtered[$key] = $file;
 		}
 		$listData['fileList'] = $filtered;
 		$listData['folderList'] = array();
@@ -151,6 +113,7 @@ class elasticFulltextPlugin extends PluginBase {
 
 	// 兼容 Kodbox 对物理路径及其他插件发起的正文读取。
 	public function fileContentText($file, $makeNow = false) {
+		if (!$this->isOpen()) return false;
 		$fileID = intval(_get((array)$file, 'fileID', 0));
 		if (!$fileID) return false;
 		try {
@@ -162,14 +125,28 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function task() {
+		if (!$this->isOpen()) return 0;
+		$lock = @fopen(rtrim(TEMP_PATH, '/\\').'/elastic-fulltext-task.lock', 'c');
+		if (!$lock || !@flock($lock, LOCK_EX | LOCK_NB)) {if ($lock) fclose($lock); return 0;}
+		try {return $this->runTask();}
+		finally {@flock($lock, LOCK_UN); @fclose($lock);}
+	}
+
+	private function runTask() {
 		$this->initTable();
 		$client = $this->client();
 		$client->ensureInfrastructure();
 		$config = $this->getConfig();
 		$batch = max(1, min(200, intval(_get($config, 'batchSize', 20))));
 		$cursor = $this->readCursor();
-		$extensions = $this->normalizeExtensions(_get($config, 'allowExtensions', ''));
+		$extensions = $this->configuredExtensions($config);
 		if (!$extensions) return 0;
+		$failedRows = Model($this->stateTable)->where(array('status' => 3))->order('indexTime asc')->limit(min(5, $batch))->select();
+		foreach ((array)$failedRows as $failed) {
+			$file = Model('File')->where(array('fileID' => intval($failed['fileID'])))->find();
+			$ext = $file ? strtolower(get_path_ext(_get($file, 'name', ''))) : '';
+			if ($file && in_array($ext, $extensions, true)) $this->indexFileRecord($file, $ext, $client, $config);
+		}
 		// 官方 docSearch 以 io_file 为扫描源。物理 fileID 天然去重，也能直接使用真实修改时间。
 		$where = array('fileID' => array('gt', $cursor));
 		$rows = Model('File')->where($where)->order('fileID asc')->limit($batch)->select();
@@ -275,20 +252,30 @@ class elasticFulltextPlugin extends PluginBase {
 		}
 	}
 
+	public function status() {
+		if (!KodUser::isRoot()) return show_json(LNG('explorer.noPermissionAction'), false);
+		return show_json(array('html' => $this->statusHtml()));
+	}
+
 	private function statusHtml() {
 		$this->initTable();
 		$ok = false; $version = '-'; $documents = 0; $error = '';
 		try {
-			$client = $this->client(); $info = $client->info(); $ok = true;
+			$client = $this->client(); $info = $client->info(3); $ok = true;
 			$version = _get(_get($info, 'version', array()), 'number', '-');
 			$documents = $client->count();
 		} catch (Throwable $e) {$error = $e->getMessage();}
 		$indexed = intval(Model($this->stateTable)->where(array('status' => 1))->count());
 		$skipped = intval(Model($this->stateTable)->where(array('status' => 2))->count());
 		$failed = intval(Model($this->stateTable)->where(array('status' => 3))->count());
+		$cursor = $this->readCursor();
+		$maxID = intval(Model('File')->max('fileID'));
+		$pending = max(0, $maxID - $cursor);
 		$color = $ok ? '#20a53a' : '#d9822b';
 		return '<div style="line-height:1.9"><div><b>Elasticsearch：</b><span style="color:'.$color.'">● '.($ok ? '正常' : '异常').'</span> '.$this->escape($version).'</div>'
-			.'<div><b>索引文档：</b>'.$documents.'；<b>已处理：</b>'.$indexed.'；<b>跳过：</b>'.$skipped.'；<b>失败：</b>'.$failed.'</div>'
+			.'<div><b>扫描进度：</b>'.$cursor.' / '.$maxID.'；<b>待扫描（估算）：</b>'.$pending.'</div>'
+			.'<div><b>索引文档：</b>'.$documents.'；<b>成功：</b>'.$indexed.'；<b>跳过：</b>'.$skipped.'；<b>待重试：</b>'.$failed.'</div>'
+			.'<div class="elastic-fulltext-status-actions"><button type="button" class="btn btn-primary btn-sm elastic-fulltext-action" data-operation="run">立即处理一批</button> <button type="button" class="btn btn-default btn-sm elastic-fulltext-action" data-operation="rebuild">重建索引</button></div>'
 			.($error ? '<div style="color:#c62828">'.$this->escape($error).'</div>' : '').'</div>';
 	}
 
@@ -310,19 +297,25 @@ class elasticFulltextPlugin extends PluginBase {
 		return Model('SystemTask')->add($data);
 	}
 
-	private function restartTaskRunner() {
-		try {AutoTask::restart(); AutoTask::start();} catch (Throwable $e) {$this->log('task runner: '.$e->getMessage());}
-	}
-
 	private function client($config = null) {
 		include_once($this->pluginPath.'lib/ElasticClient.class.php');
 		return new KodboxElasticClient($config === null ? $this->getConfig() : $config);
 	}
 
 	private function normalizeExtensions($value) {
+		if (is_array($value)) $value = implode(',', $value);
 		$items = preg_split('/[\s,;]+/', strtolower((string)$value));
 		return array_values(array_unique(array_filter(array_map(function($v) {return preg_replace('/[^a-z0-9]+/', '', $v);}, $items))));
 	}
+
+	private function configuredExtensions($config = null) {
+		$config = $config === null ? $this->getConfig() : $config;
+		$allowed = $this->normalizeExtensions(_get($config, 'allowExtensions', ''));
+		if (_get($config, 'extensionMode', 'allow') !== 'deny') return $allowed;
+		return array_values(array_diff($allowed, $this->normalizeExtensions(_get($config, 'denyExtensions', ''))));
+	}
+
+	private function isOpen() {return _get($this->getConfig(), 'serviceEnabled', '1') == '1';}
 
 	private function isPlainText($ext) {
 		return in_array($ext, array('txt','md','log','csv','json','xml','html','htm','css','js','php','py','java','c','cpp','h','ini','yaml','yml'), true);
@@ -346,15 +339,6 @@ class elasticFulltextPlugin extends PluginBase {
 		$text = preg_replace('/[ \t]{2,}/', ' ', $text);
 		$text = trim($text, " \t\r\n\f");
 		return function_exists('utf8Repair') ? utf8Repair($text) : $text;
-	}
-
-	private function safeFileContent($fileID) {
-		try {
-			$content = $this->sanitizeSnippet($this->client()->getContent($fileID));
-			return $content !== '' ? $content : '';
-		} catch (Throwable $e) {
-			return '';
-		}
 	}
 
 	private function escape($value) {return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');}
