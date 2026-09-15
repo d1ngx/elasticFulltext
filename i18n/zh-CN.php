@@ -12,7 +12,7 @@ return array(
 	'elasticFulltext.config.maxSize' => '最大文件大小（MB）',
 	'elasticFulltext.config.maxSizeDesc' => '超过限制的文件会被跳过，避免 PHP/Elasticsearch 内存峰值。',
 	'elasticFulltext.config.batch' => '每批文件数',
-	'elasticFulltext.config.batchDesc' => '后台计划任务每分钟处理一批物理文件。',
+	'elasticFulltext.config.batchDesc' => '每次任务要索引的目标文件数，范围 1–500。单次会尽量跑满；图片等非目标格式不占用名额。',
 	'elasticFulltext.config.searchLimit' => '最大候选结果',
 	'elasticFulltext.config.searchLimitDesc' => '候选结果随后仍由 Kodbox 核心进行目录和权限过滤。',
 	'elasticFulltext.config.verifyTls' => '验证 HTTPS 证书',

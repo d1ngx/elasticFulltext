@@ -2,7 +2,7 @@
 
 为 Kodbox 提供 PDF、Office 与文本文件的全文搜索。设计参考 Nextcloud Full Text Search 的分层方式，但代码为独立实现：Kodbox 管理文件、目录与访问权限，Elasticsearch `ingest-attachment`（Apache Tika）负责内容提取和检索。
 
-当前版本：`1.3.2`
+当前版本：`1.3.7`
 
 已验证环境：
 
@@ -14,7 +14,7 @@
 ## 功能
 
 - 支持 PDF、Word、Excel、PowerPoint、OpenDocument、RTF、EPUB 和常见文本格式。
-- 每分钟增量扫描一批；修改时间未变化的文件不会重复上传。
+- 每分钟增量扫描一批目标文件（自动跳过图片等非索引格式）；修改时间未变化的文件不会重复上传。
 - 删除后的物理文件会在一轮扫描结束后从索引清理。
 - 直接接管 Kodbox 原生“文件内容”搜索；ES 只返回 `fileID` 候选，最终结果仍由 Kodbox 核心按当前目录和用户权限过滤。
 - 对 Kodbox 返回结果再次执行严格的 `fileID` 交集过滤，避免当前目录中的无关文件混入结果。
@@ -110,19 +110,20 @@ PDF/Office 文件以 Base64 发送给 Elasticsearch 的 `kodbox-attachment` inge
 | Index | `kodbox-fulltext` | 插件独立使用的索引名 |
 | 索引扩展名 | 见“支持的格式” | 使用英文逗号分隔 |
 | 最大文件大小 | `50 MB` | 超过限制的文件标记为跳过 |
-| 每批文件数 | `20` | 每次后台任务处理的最大数量 |
+| 每批文件数 | `50` | 每次任务要索引的目标文件数（1–500）；非匹配扩展名不计入 |
 | 最大候选结果 | `1000` | ES 返回后仍会经过 Kodbox 权限过滤 |
 | 验证 HTTPS 证书 | 开启 | 仅对 HTTPS 地址生效 |
 
 ## 增量索引
 
-插件每分钟运行一次计划任务，并参考官方 `docSearch` 的方式按物理文件表 `io_file.fileID` 分批扫描：
+插件每分钟运行一次计划任务，并参考官方 `docSearch` 的方式按物理文件表 `io_file.fileID` 扫描。每次任务会跳过非目标格式，直到索引满配置的批次或用完约 50 秒时间窗口：
 
 - 文件修改时间未变化时不会重复发送到 Elasticsearch。
 - 修改后的文件会重新提取和覆盖原文档。
 - 每个物理文件只处理一次，不会因多个 `io_source` 引用而重复索引。
 - 完成一轮扫描后，已从 Kodbox 删除的物理文件会从 ES 清理。
-- 失败任务会在后续扫描中重试，错误信息记录于插件状态表和 Kodbox 日志。
+- 失败、跳过、成功都会写入 Kodbox 的 `elasticFulltext` 日志；配置页「运行情况」会列出最近失败和跳过的文件。
+- 日志位于 Kodbox 后台日志的 `elasticFulltext` 分类（成功为 info，跳过为 warning，失败为 error）。
 
 首次安装建议点击一次“重建索引”，然后等待后台任务完成剩余批次。
 
@@ -131,6 +132,14 @@ PDF/Office 文件以 Base64 发送给 Elasticsearch 的 `kodbox-attachment` inge
 ### 插件启用后按钮没有反应
 
 插件前端脚本在 Kodbox 页面加载时注入。启用或更新插件后按 `Ctrl+F5` 强制刷新，再打开插件配置。
+
+### 运行情况一直转圈
+
+升级到 `1.3.3` 后打开配置即可自动刷新，不必先点“连接测试”。若仍无数据，确认计划任务已开启，并查看状态里的“上次任务”时间。
+
+### 自动索引一天只有几百个
+
+旧版本把图片等非目标文件也算进每批限额。`1.3.3` 改为只统计真正索引的文档，并在约 50 秒内连续扫描。更新插件后保存一次配置，让计划任务重新注册。后台管理里确认该任务为“每 1 分钟”。
 
 ### 无法连接 Elasticsearch
 
@@ -169,7 +178,7 @@ curl http://elasticsearch:9200/_ingest/pipeline/kodbox-attachment?pretty
 - 大文件会在 PHP 中读取并 Base64 编码，峰值内存可能达到文件大小的数倍。默认上限 50 MB，可按容器内存调整。
 - 当前版本使用 Elasticsearch 标准分析器。中文可以搜索，但如需更自然的中文分词，可另装 IK 分词器并在新索引 mapping 中配置 analyzer。
 - “重建索引”只删除本插件配置的索引，不会触碰 Nextcloud 的索引。
-- 日志位于 Kodbox 日志目录的 `elasticFulltext` 分类中。
+- 日志位于 Kodbox 后台日志的 `elasticFulltext` 分类（成功为 info，跳过为 warning，失败为 error）。配置页也会显示最近失败/跳过明细。
 - 索引中包含从文件提取的正文，应把 Elasticsearch 保留在可信内网，不要无认证暴露到公网。
 
 ## 目录结构

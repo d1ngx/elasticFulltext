@@ -94,8 +94,8 @@ class KodboxElasticClient {
 
 	public function deleteFile($fileID) {$this->request('DELETE', '/'.$this->index.'/_doc/'.intval($fileID), null, array(200, 404));}
 
-	public function count() {
-		$result = $this->request('GET', '/'.$this->index.'/_count', null, array(200, 404));
+	public function count($timeout = 5) {
+		$result = $this->request('GET', '/'.$this->index.'/_count', null, array(200, 404), $timeout);
 		return intval(_get($result, 'count', 0));
 	}
 
@@ -124,12 +124,40 @@ class KodboxElasticClient {
 		if (!is_array($data)) $data = array('_raw' => $response);
 		$data['_status'] = $status;
 		if (!in_array($status, $allowed, true)) {
-			$reason = _get(_get(_get($data, 'error', array()), 'root_cause', array()), 0, array());
-			$message = is_array($reason) ? _get($reason, 'reason', '') : '';
-			if (!$message) $message = is_array(_get($data, 'error', null)) ? json_encode(_get($data, 'error', array()), JSON_UNESCAPED_UNICODE) : _get($data, 'error', $response);
-			throw new Exception('Elasticsearch HTTP '.$status.': '.substr((string)$message, 0, 800));
+			throw new Exception('Elasticsearch HTTP '.$status.': '.$this->formatError($data, $response));
 		}
 		return $data;
+	}
+
+	private function formatError($data, $raw) {
+		$parts = array();
+		$error = _get($data, 'error', array());
+		$this->collectReasons($error, $parts);
+		$root = _get(_get($error, 'root_cause', array()), 0, array());
+		$this->collectReasons($root, $parts);
+		$unique = array();
+		foreach ($parts as $part) {
+			$part = trim((string)$part);
+			if ($part === '' || isset($unique[$part])) continue;
+			$unique[$part] = true;
+		}
+		$parts = array_keys($unique);
+		$generic = 'Error parsing document in field [data]';
+		$specific = array_values(array_filter($parts, function($part) use ($generic) {return $part !== $generic;}));
+		$message = $specific ? implode(' | ', array_slice($specific, 0, 5)) : ($parts ? $parts[0] : '');
+		if (!$message) $message = is_array($error) ? json_encode($error, JSON_UNESCAPED_UNICODE) : (string)($error ? $error : $raw);
+		if (strpos($message, 'does not have any content type') !== false || strpos($message, 'Package require content types') !== false) {
+			$message .= '；Office 包内有未登记 Content Type 的部件（常见于 customXml 测试载荷或损坏文件），不是 xlsx/docx 格式本身不支持';
+		} else if (stripos($message, 'Encrypted') !== false || stripos($message, 'password') !== false) {
+			$message .= '；文件可能已加密';
+		}
+		return substr($message, 0, 1200);
+	}
+
+	private function collectReasons($node, &$parts, $depth = 0) {
+		if (!is_array($node) || $depth > 8) return;
+		if (!empty($node['reason']) && is_string($node['reason'])) $parts[] = $node['reason'];
+		if (isset($node['caused_by'])) $this->collectReasons($node['caused_by'], $parts, $depth + 1);
 	}
 
 	private function toUtf8($content) {

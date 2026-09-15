@@ -12,7 +12,7 @@ return array(
 	'elasticFulltext.config.maxSize' => 'Maximum file size (MB)',
 	'elasticFulltext.config.maxSizeDesc' => 'Larger files are skipped to limit PHP and Elasticsearch memory usage.',
 	'elasticFulltext.config.batch' => 'Files per batch',
-	'elasticFulltext.config.batchDesc' => 'The background task processes one batch of physical files every minute.',
+	'elasticFulltext.config.batchDesc' => 'Target files to index per run (1–500). Unrelated types such as images are skipped and do not consume the quota.',
 	'elasticFulltext.config.searchLimit' => 'Maximum candidates',
 	'elasticFulltext.config.searchLimitDesc' => 'Kodbox still applies directory and permission filtering.',
 	'elasticFulltext.config.verifyTls' => 'Verify HTTPS certificate',

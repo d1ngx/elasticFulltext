@@ -1,14 +1,14 @@
-{"id":"elasticFulltext","name":"{{LNG['elasticFulltext.meta.name']}}","title":"{{LNG['elasticFulltext.meta.title']}}","version":"1.3.2","category":"tools","source":{"thumb":"{{pluginHost}}static/icon.svg","className":"font-icon ri-file-search-line bg-blue-6"},"description":"{{LNG['elasticFulltext.meta.desc']}}","auther":{"copyright":"KodBox community plugin","homePage":"https://github.com/d1ngx/elasticFulltext"},
+{"id":"elasticFulltext","name":"{{LNG['elasticFulltext.meta.name']}}","title":"{{LNG['elasticFulltext.meta.title']}}","version":"1.3.7","category":"tools","source":{"thumb":"{{pluginHost}}static/icon.svg","className":"font-icon ri-file-search-line bg-blue-6"},"description":"{{LNG['elasticFulltext.meta.desc']}}","auther":{"copyright":"KodBox community plugin","homePage":"https://github.com/d1ngx/elasticFulltext"},
 "configItem":{
-"formStyle":{"loadFile":"{{pluginHost}}static/admin.js","tabs":{"基础设置":"serviceEnabled,elasticUrl,indexName,serviceCheck,runStatus","其他设置":"extensionMode,allowExtensions,denyExtensions,maxFileSizeMB,batchSize"}},
+"formStyle":{"loadFile":"{{pluginHost}}static/admin.js","tabs":{"基础设置":"serviceEnabled,elasticUrl,indexName,batchSize,serviceCheck,runStatus","其他设置":"extensionMode,allowExtensions,denyExtensions,maxFileSizeMB"}},
 "serviceEnabled":{"type":"switch","value":"1","display":"启用全文搜索","desc":"关闭后停止索引任务和正文搜索，不影响已有索引。"},
 "elasticUrl":{"type":"input","value":"http://elasticsearch:9200","display":"Elasticsearch URL","desc":"{{LNG['elasticFulltext.config.elasticUrlDesc']}}","require":1},
 "indexName":{"type":"input","value":"kodbox-fulltext","display":"索引名称","desc":"{{LNG['elasticFulltext.config.indexDesc']}}","require":1},
-"serviceCheck":{"type":"html","value":"<button type='button' class='btn btn-primary btn-sm elastic-fulltext-action' data-operation='test'>连接测试</button>","display":"服务检测"},
+"serviceCheck":{"type":"html","value":"<button type='button' class='btn btn-primary btn-sm elastic-fulltext-action' data-operation='test'>连接测试</button><span class='elastic-fulltext-test-msg'></span>","display":"服务检测"},
 "runStatus":{"type":"html","value":"<div class='elastic-fulltext-status'><span class='elastic-fulltext-dot is-loading'></span>正在检测 Elasticsearch 服务…</div>","display":"运行情况"},
 "extensionMode":{"type":"segment","value":"allow","display":"支持格式策略","info":{"allow":"允许格式","deny":"禁止格式"},"switchItem":{"allow":"allowExtensions","deny":"denyExtensions"}},
 "allowExtensions":{"type":"tags","value":"doc,docx,docm,dot,dotm,dotx,wps,wpt,wpl,ppt,pptx,ppsx,pptm,ppam,potm,potx,pps,ppsm,xls,xlsx,xlsm,xlam,xltx,xltm,xlsb,sldx,pdf,odt,ods,odp,odf,odft,ofx,ots,oxt,otp,eot,otm,ott,rtf,epub,chm,mht,eml,emlx,msg,txt,md,log,csv,json,xml,html,htm","display":"允许的文件格式","desc":"仅转换这些扩展名。"},
 "denyExtensions":{"type":"tags","value":"","display":"禁止的文件格式","desc":"从内置支持格式中排除这些扩展名。"},
 "maxFileSizeMB":{"type":"number","value":"50","display":"最大文件支持","titleRight":"MB","desc":"{{LNG['elasticFulltext.config.maxSizeDesc']}}"},
-"batchSize":{"type":"number","value":"20","display":"每批文件数","desc":"{{LNG['elasticFulltext.config.batchDesc']}}"}
+"batchSize":{"type":"number","value":"50","display":"每批文件数","info":{"from":1,"to":500,"step":1},"desc":"{{LNG['elasticFulltext.config.batchDesc']}}"}
 }}
