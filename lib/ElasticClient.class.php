@@ -18,7 +18,7 @@ class KodboxElasticClient {
 		$this->request('PUT', '/_ingest/pipeline/'.$this->pipeline, array(
 			'description' => 'Extract PDF and Office text for Kodbox',
 			'processors' => array(
-				array('attachment' => array('field' => 'data', 'target_field' => 'attachment', 'indexed_chars' => -1, 'remove_binary' => true)),
+				array('attachment' => array('field' => 'data', 'target_field' => 'attachment', 'indexed_chars' => 100000, 'remove_binary' => true)),
 				array('convert' => array('field' => 'attachment.content', 'target_field' => 'content', 'type' => 'string', 'ignore_failure' => true)),
 				array('remove' => array('field' => 'attachment', 'ignore_missing' => true)),
 			),
@@ -53,7 +53,7 @@ class KodboxElasticClient {
 			$document['data'] = base64_encode($content);
 			$path .= '&pipeline='.$this->pipeline;
 		}
-		return $this->request('PUT', $path, $document);
+		return $this->request('PUT', $path, $document, array(200, 201), $plainText ? 20 : 35);
 	}
 
 	public function search($words, $limit) {
