@@ -2,7 +2,7 @@
 return array(
 	'elasticFulltext.meta.name' => 'Elasticsearch 全文搜索',
 	'elasticFulltext.meta.title' => 'PDF、Office 与文本全文搜索',
-	'elasticFulltext.meta.desc' => '使用 Elasticsearch ingest-attachment 为网盘文件建立全文索引。',
+	'elasticFulltext.meta.desc' => 'Elasticsearch ingest-attachment（Tika）抽取正文供文件内容搜索；与 AIRAG 共用提取结果，不重复转换。',
 	'elasticFulltext.status.loading' => '正在读取索引状态…',
 	'elasticFulltext.status.title' => '运行状态',
 	'elasticFulltext.config.elasticUrlDesc' => '网盘可访问的地址，例如 http://elasticsearch:9200。',

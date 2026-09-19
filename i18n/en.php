@@ -2,7 +2,7 @@
 return array(
 	'elasticFulltext.meta.name' => 'Elasticsearch Full-text Search',
 	'elasticFulltext.meta.title' => 'Full-text search for PDF, Office and text files',
-	'elasticFulltext.meta.desc' => 'Indexes network-disk files with Elasticsearch ingest-attachment.',
+	'elasticFulltext.meta.desc' => 'Indexes files with Elasticsearch ingest-attachment (Tika) and shares extracted text with AIRAG so the same file is not converted twice.',
 	'elasticFulltext.status.loading' => 'Loading index status…',
 	'elasticFulltext.status.title' => 'Status',
 	'elasticFulltext.config.elasticUrlDesc' => 'URL reachable from the network disk, e.g. http://elasticsearch:9200.',

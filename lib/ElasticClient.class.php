@@ -18,7 +18,7 @@ class KodboxElasticClient {
 		$this->request('PUT', '/_ingest/pipeline/'.$this->pipeline, array(
 			'description' => 'Extract PDF and Office text for Kodbox',
 			'processors' => array(
-				array('attachment' => array('field' => 'data', 'target_field' => 'attachment', 'indexed_chars' => 100000, 'remove_binary' => true)),
+				array('attachment' => array('field' => 'data', 'target_field' => 'attachment', 'indexed_chars' => 200000, 'remove_binary' => true)),
 				array('convert' => array('field' => 'attachment.content', 'target_field' => 'content', 'type' => 'string', 'ignore_failure' => true)),
 				array('remove' => array('field' => 'attachment', 'ignore_missing' => true)),
 			),
@@ -86,10 +86,19 @@ class KodboxElasticClient {
 		return $result;
 	}
 
+	public function getDocument($fileID) {
+		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,modifyTime,name,size', null, array(200, 404), 8);
+		if ($result['_status'] === 404) return array();
+		return array(
+			'content' => (string)_get($result, 'content', ''),
+			'modifyTime' => intval(_get($result, 'modifyTime', 0)),
+			'name' => (string)_get($result, 'name', ''),
+			'size' => intval(_get($result, 'size', 0)),
+		);
+	}
+
 	public function getContent($fileID) {
-		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content', null, array(200, 404));
-		if ($result['_status'] === 404) return '';
-		return (string)_get($result, 'content', '');
+		return (string)_get($this->getDocument($fileID), 'content', '');
 	}
 
 	public function deleteFile($fileID) {$this->request('DELETE', '/'.$this->index.'/_doc/'.intval($fileID), null, array(200, 404));}

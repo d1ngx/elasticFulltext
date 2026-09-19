@@ -140,7 +140,18 @@ class elasticFulltextPlugin extends PluginBase {
 			if ($lock) fclose($lock);
 			return -1;
 		}
+		$heavy = @fopen(rtrim(TEMP_PATH, '/\\').'/kod-heavy-index.lock', 'c');
+		if (!$heavy || !@flock($heavy, LOCK_EX | LOCK_NB)) {
+			if ($heavy) fclose($heavy);
+			flock($lock, LOCK_UN); fclose($lock);
+			return -1;
+		}
 		try {
+			$pressureLib = __DIR__.'/../aiRag/lib/Backpressure.class.php';
+			if (is_file($pressureLib)) {
+				require_once $pressureLib;
+				if (!AiRagBackpressure::inspect(array())['ok']) return 0;
+			}
 			if (function_exists('ignore_timeout')) ignore_timeout();
 			@ignore_user_abort(true);
 			if (class_exists('KodLog')) KodLog::$checkClientAbort = false;
@@ -149,7 +160,7 @@ class elasticFulltextPlugin extends PluginBase {
 			$this->log('task failed: '.$e->getMessage(), 'error');
 			$this->writeCursor($this->readCursor(), array('running' => 0, 'current' => ''));
 			return 0;
-		} finally {@flock($lock, LOCK_UN); @fclose($lock);}
+		} finally {@flock($heavy, LOCK_UN); @fclose($heavy); @flock($lock, LOCK_UN); @fclose($lock);}
 	}
 
 	private function runTask($fillBatch = false) {
@@ -178,6 +189,7 @@ class elasticFulltextPlugin extends PluginBase {
 		));
 		$failedRows = Model($this->stateTable)->where(array('status' => 3, 'indexTime' => array('lt', time() - 900)))->order('indexTime asc')->limit(min(5, $batch))->select();
 		foreach ((array)$failedRows as $failedRow) {
+			if (class_exists('AiRagBackpressure')) AiRagBackpressure::assertReady(array());
 			if (microtime(true) >= $deadline) break;
 			$file = Model('File')->where(array('fileID' => intval($failedRow['fileID'])))->find();
 			$ext = $file ? strtolower(get_path_ext(_get($file, 'name', ''))) : '';
@@ -207,6 +219,7 @@ class elasticFulltextPlugin extends PluginBase {
 				continue;
 			}
 			foreach ((array)$rows as $file) {
+				if (class_exists('AiRagBackpressure')) AiRagBackpressure::assertReady(array());
 				$cursor = max($cursor, intval($file['fileID']));
 				$scanned++;
 				$ext = strtolower(get_path_ext(_get($file, 'name', '')));
@@ -232,11 +245,15 @@ class elasticFulltextPlugin extends PluginBase {
 				$wrapped = true;
 			}
 		}
+		$maxID = intval(Model('File')->max('fileID'));
+		$complete = $wrapped && $processed === 0;
+		if ($complete || $cursor > $maxID) $cursor = $maxID;
 		$this->writeCursor($cursor, array(
 			'indexed' => $processed, 'skipped' => $skipped, 'failed' => $failed,
 			'scanned' => $scanned, 'ignored' => $ignored, 'running' => 0, 'current' => '',
+			'complete' => $complete ? 1 : 0, 'completeMax' => $maxID,
 		));
-		$this->log('batch indexed='.$processed.' skipped='.$skipped.' failed='.$failed.' ignored='.$ignored.' scanned='.$scanned.' cursor='.$cursor);
+		$this->log('batch indexed='.$processed.' skipped='.$skipped.' failed='.$failed.' ignored='.$ignored.' scanned='.$scanned.' cursor='.$cursor.' complete='.($complete?1:0));
 		return $processed;
 	}
 
@@ -258,17 +275,27 @@ class elasticFulltextPlugin extends PluginBase {
 			return 'skip';
 		}
 		try {
-			$path = _get($file, 'path', '');
-			if (!$path || !IO::exist($path)) throw new Exception('找不到物理文件');
-			$content = IO::getContent($path);
-			if ($content === false) throw new Exception('无法读取文件内容');
-			if (!$this->isPlainText($ext)) $content = $this->sanitizeOfficeZip($content, $ext);
+			include_once($this->pluginPath.'lib/CorpusShare.class.php');
 			$document = $file;
-			$document['sourceID'] = 0;
+			$document['sourceID'] = intval(_get($file, 'sourceID', 0));
 			$document['fileType'] = $ext;
-			$client->indexFile($document, $content, $this->isPlainText($ext));
+			$origin = '';
+			$ownDoc = array();
+			try { $ownDoc = $client->getDocument($fileID); } catch (Throwable $e) { $ownDoc = array(); }
+			if (KodboxCorpusShare::isFresh($ownDoc, $modifyTime)) {
+				$origin = 'fulltext';
+			}
+			if ($origin === '') {
+				$path = _get($file, 'path', '');
+				if (!$path || !IO::exist($path)) throw new Exception('找不到物理文件');
+				$content = IO::getContent($path);
+				if ($content === false) throw new Exception('无法读取文件内容');
+				if (!$this->isPlainText($ext)) $content = $this->sanitizeOfficeZip($content, $ext);
+				$client->indexFile($document, $content, $this->isPlainText($ext));
+				$origin = 'tika';
+			}
 			$this->saveState($file, 1, '');
-			$this->log('ok '.$this->fileLabel($file).' size='.intval(_get($file, 'size', 0)));
+			$this->log('ok '.$this->fileLabel($file).' size='.intval(_get($file, 'size', 0)).' via='.$origin);
 			return 'ok';
 		} catch (Throwable $e) {
 			$this->saveState($file, 3, substr($e->getMessage(), 0, 1000));
@@ -338,18 +365,35 @@ class elasticFulltextPlugin extends PluginBase {
 				return show_json(array('message' => 'Elasticsearch '.$info['version']['number'].' 连接正常'));
 			}
 			if ($operation === 'run') {
-				if ($this->taskBusy()) return show_json(array('message' => '后台正在索引，请稍后再试'));
-				$this->writeCursor($this->readCursor(), array('running' => 1, 'current' => '准备中', 'indexed' => 0, 'started' => time()));
+				if ($this->taskBusy()) return show_json(array('message' => '后台正在索引，请稍后再试'), false);
+				if (!$this->hasPendingWork()) {
+					$maxID = intval(Model('File')->max('fileID'));
+					$this->writeCursor(max($this->readCursor(), $maxID), array(
+						'running' => 0, 'current' => '', 'complete' => 1, 'completeMax' => $maxID,
+					));
+					return show_json(array(
+						'message' => '全文索引已完成，没有待处理文件。如需重新提取请点「重建索引」。',
+						'idle' => 1,
+					));
+				}
+				$this->writeCursor($this->readCursor(), array('running' => 1, 'current' => '准备中', 'indexed' => 0, 'started' => time(), 'complete' => 0));
 				$this->replyAndContinue('已开始处理，进度见运行情况');
 				$this->runLocked(true);
 				return;
 			}
 			if ($operation === 'rebuild') {
 				if ($this->taskBusy()) return show_json(array('message' => '后台正在索引，请稍后再试'));
+				$heavy = @fopen(rtrim(TEMP_PATH, '/\\').'/kod-heavy-index.lock', 'c');
+				if (!$heavy || !@flock($heavy, LOCK_EX | LOCK_NB)) {
+					if ($heavy) fclose($heavy);
+					return show_json(array('message' => '全文或向量任务正在运行，请稍后重建'), false);
+				}
+				try {
 				$this->initTable();
 				$this->client()->rebuild();
 				Model($this->stateTable)->where(array('fileID' => array('gt', 0)))->delete();
 				$this->writeCursor(0, array('running' => 1, 'current' => '准备中', 'indexed' => 0, 'skipped' => 0, 'failed' => 0, 'scanned' => 0, 'ignored' => 0, 'started' => time()));
+				} finally { flock($heavy, LOCK_UN); fclose($heavy); }
 				$this->replyAndContinue('索引已重建，正在处理首批');
 				$this->runLocked(true);
 				return;
@@ -386,14 +430,24 @@ class elasticFulltextPlugin extends PluginBase {
 		} else {
 			$ok = true; $version = ''; $documents = '-';
 		}
-		$indexed = intval(Model($this->stateTable)->where(array('status' => 1))->count());
-		$skipped = intval(Model($this->stateTable)->where(array('status' => 2))->count());
-		$failed = intval(Model($this->stateTable)->where(array('status' => 3))->count());
+		$extensions = $this->configuredExtensions();
+		$fileTotal = intval(Model('File')->count());
+		$targetTotal = $this->countTargetFiles($extensions);
+		$nonDoc = max(0, $fileTotal - $targetTotal);
+		$indexed = $this->countAliveStatus(1);
+		$skipped = $this->countAliveStatus(2);
+		$failed = $this->countAliveStatus(3);
+		$pendingDocs = max(0, $targetTotal - $indexed - $skipped - $failed);
 		$cursorData = $this->readCursorData();
 		$cursor = intval(_get($cursorData, 'fileID', 0));
 		$lastRun = intval(_get($cursorData, 'time', 0));
-		$maxID = intval(Model('File')->max('fileID'));
-		$pending = max(0, $maxID - $cursor);
+		if (!$lastRun) {
+			$lastState = Model($this->stateTable)->order('indexTime desc')->find();
+			$lastRun = intval(_get($lastState, 'indexTime', 0));
+		}
+		$remainFiles = $cursor > 0 ? intval(Model('File')->where(array('fileID' => array('gt', $cursor)))->count()) : $fileTotal;
+		$complete = intval(_get($cursorData, 'complete', 0)) === 1 || ($pendingDocs === 0 && $remainFiles === 0 && $fileTotal > 0);
+		if ($complete) $remainFiles = 0;
 		$color = $ok ? '#20a53a' : '#d9822b';
 		$lastRunText = $lastRun ? date('Y-m-d H:i:s', $lastRun) : '尚未运行';
 		$batchSize = max(1, min(500, intval(_get($this->getConfig(), 'batchSize', 50))));
@@ -410,20 +464,30 @@ class elasticFulltextPlugin extends PluginBase {
 		}
 		$progress = '';
 		if ($running) {
-			$progress = '<div class="elastic-fulltext-progress"><div class="elastic-fulltext-progress-head"><span><span class="elastic-fulltext-dot is-loading"></span>正在索引</span><span class="v">'.$lastIndexed.'/'.$batchSize.'</span></div>'
+			$progress = '<div class="elastic-fulltext-progress"><div class="elastic-fulltext-progress-head"><span><span class="elastic-fulltext-dot is-loading"></span>正在索引</span><span class="v">本批 '.$lastIndexed.'/'.$batchSize.' · 已入库 '.$indexed.' / 可索引 '.$targetTotal.'</span></div>'
 				.($current ? '<div class="elastic-fulltext-progress-name" title="'.$this->escape($current).'">'.$this->escape($current).'</div>' : '')
 				.'</div>';
+		} else if ($complete) {
+			$progress = '<div class="elastic-fulltext-progress is-done"><div class="elastic-fulltext-progress-head"><span>全文扫描已完成</span><span class="v">已入库 '.$indexed.' / 可索引 '.$targetTotal.'</span></div></div>';
 		}
 		$esLine = $fast ? '' : '<div class="elastic-fulltext-es"><span style="color:'.$color.'">● '.($ok ? '正常' : '异常').'</span> '.$this->escape($version).'</div>';
-		$indexedValue = $documents === '-' ? $indexed : $documents;
-		$totals = $this->statusStat('扫描', $cursor.' / '.$maxID, true)
-			.$this->statusStat('索引', $indexedValue)
-			.$this->statusStat('剩余', $pending)
+		$totals = $this->statusStat('网盘文件', $fileTotal)
+			.$this->statusStat('可索引', $targetTotal)
+			.$this->statusStat('已入库', $indexed)
+			.$this->statusStat('待处理', $pendingDocs)
+			.$this->statusStat('非文档', $nonDoc)
 			.$this->statusStat('过大', $skipped)
 			.$this->statusStat('失败', $failed)
-			.$this->statusStat('上次', $lastRun ? $lastRunText : '尚未运行', true);
+			.$this->statusStat('待扫描', $remainFiles)
+			.$this->statusStat('上次', $lastRunText, true);
+		$why = '<div class="elastic-fulltext-hint">「可索引」只统计允许的扩展名；图片、视频等计入「非文档」。「待处理」= 可索引 − 已入库 − 过大 − 失败。「待扫描」是游标之后还未走过的物理文件，不是 fileID 差值。</div>';
+		$esNote = '';
+		if (!$fast && is_int($documents) && $documents !== $indexed) {
+			$esNote = '<div class="elastic-fulltext-hint">Elasticsearch 当前 '.$documents.' 篇。与「已入库」不一致时，多为已删除文件尚未从索引清理，下一轮扫描会回收。</div>';
+		}
 		return $progress.$esLine
 			.'<div class="elastic-fulltext-metrics">'.$totals.'</div>'
+			.$why.$esNote
 			.($recentFail ? '<div class="elastic-fulltext-note"><span class="k">失败</span> '.$recentFail.'</div>' : '')
 			.($recentSkip ? '<div class="elastic-fulltext-note"><span class="k">过大</span> '.$recentSkip.'</div>' : '')
 			.'<div class="elastic-fulltext-status-actions"><button type="button" class="btn btn-primary btn-sm elastic-fulltext-action" data-operation="run">立即处理一批</button> <button type="button" class="btn btn-default btn-sm elastic-fulltext-action" data-operation="rebuild">重建索引</button></div>'
@@ -433,6 +497,38 @@ class elasticFulltextPlugin extends PluginBase {
 	private function statusStat($label, $value, $wide = false) {
 		$class = 'elastic-fulltext-stat'.($wide ? ' is-wide' : '');
 		return '<div class="'.$class.'"><span class="k">'.$this->escape((string)$label).'</span><span class="v">'.$this->escape((string)$value).'</span></div>';
+	}
+
+	private function countTargetFiles($extensions) {
+		$bits = array();
+		foreach ((array)$extensions as $ext) {
+			$ext = strtolower(preg_replace('/[^a-z0-9]/', '', (string)$ext));
+			if ($ext === '') continue;
+			$bits[] = "LOWER(`name`) LIKE '%.".$ext."'";
+		}
+		if (!$bits) return 0;
+		try {
+			return intval(Model('File')->where(implode(' OR ', $bits))->count());
+		} catch (Throwable $e) {
+			$total = 0;
+			foreach ((array)$extensions as $ext) {
+				$ext = strtolower(preg_replace('/[^a-z0-9]/', '', (string)$ext));
+				if ($ext === '') continue;
+				$total += intval(Model('File')->where(array('name' => array('like', '%.'.$ext)))->count());
+			}
+			return $total;
+		}
+	}
+
+	private function countAliveStatus($status) {
+		$rows = Model($this->stateTable)->where(array('status' => intval($status)))->field('fileID')->select();
+		$ids = array();
+		foreach ((array)$rows as $row) {
+			$id = intval(_get($row, 'fileID', 0));
+			if ($id) $ids[] = $id;
+		}
+		if (!$ids) return 0;
+		return intval(Model('File')->where(array('fileID' => array('in', $ids)))->count());
 	}
 
 	private function initTable() {
@@ -455,6 +551,7 @@ class elasticFulltextPlugin extends PluginBase {
 
 	private function client($config = null) {
 		include_once($this->pluginPath.'lib/ElasticClient.class.php');
+		include_once($this->pluginPath.'lib/CorpusShare.class.php');
 		return new KodboxElasticClient($config === null ? $this->getConfig() : $config);
 	}
 
@@ -478,6 +575,29 @@ class elasticFulltextPlugin extends PluginBase {
 		if ($beat && time() - $beat > 120) {
 			$this->writeCursor(intval(_get($data, 'fileID', 0)), array('running' => 0, 'current' => ''));
 		}
+	}
+
+	private function hasPendingWork() {
+		$this->initTable();
+		if (intval(Model($this->stateTable)->where(array('status' => 3, 'indexTime' => array('lt', time() - 900)))->count()) > 0) return true;
+		$maxID = intval(Model('File')->max('fileID'));
+		if ($maxID <= 0) return false;
+		$data = $this->readCursorData();
+		$cursor = intval(_get($data, 'fileID', 0));
+		if (intval(Model('File')->where(array('fileID' => array('gt', $cursor)))->count()) > 0) return true;
+		$completeMax = intval(_get($data, 'completeMax', 0));
+		if (intval(_get($data, 'complete', 0)) === 1 && $maxID <= $completeMax && $cursor >= $maxID) return false;
+		$extensions = $this->configuredExtensions();
+		$rows = Model('File')->order('fileID desc')->limit(40)->select();
+		foreach ((array)$rows as $file) {
+			$ext = strtolower(get_path_ext(_get($file, 'name', '')));
+			if (!$ext || !in_array($ext, $extensions, true)) continue;
+			$state = Model($this->stateTable)->where(array('fileID' => intval($file['fileID'])))->find();
+			$modifyTime = intval(_get($file, 'modifyTime', 0));
+			if ($state && intval($state['modifyTime']) >= $modifyTime && in_array(intval($state['status']), array(1, 2), true)) continue;
+			return true;
+		}
+		return false;
 	}
 
 	private function taskBusy() {
@@ -541,7 +661,7 @@ class elasticFulltextPlugin extends PluginBase {
 	private function writeCursor($fileID, $extra = null) {
 		$prev = $this->readCursorData();
 		$data = array('fileID' => intval($fileID), 'time' => time());
-		foreach (array('indexed', 'skipped', 'failed', 'scanned', 'ignored', 'running') as $key) {
+		foreach (array('indexed', 'skipped', 'failed', 'scanned', 'ignored', 'running', 'complete', 'completeMax') as $key) {
 			$data[$key] = is_array($extra) && array_key_exists($key, $extra) ? intval($extra[$key]) : intval(_get($prev, $key, 0));
 		}
 		$data['current'] = is_array($extra) && array_key_exists('current', $extra) ? (string)$extra['current'] : (string)_get($prev, 'current', '');

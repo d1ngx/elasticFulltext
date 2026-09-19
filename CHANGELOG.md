@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.4.1
+
+- 运行情况改为两列对齐，标签不再折行。
+- 「非文档」按允许扩展名统计，不再把未扫描文件算进去。
+- 「待扫描」改为游标之后的实际文件数；「已入库」只统计仍然存在的文件。
+
+## 1.3.21
+
+- 正文共享仅在对方插件启用时执行。
+- 修复共享正文无法把旧的跳过状态推进为已入库/待向量。
+- 不再把缺少 modifyTime 的旧 ES 文档用于有明确修改时间的当前文件。
+
+## 1.3.20
+
+- 与 AIRAG 共用已提取正文：本索引或 `kodbox-airag` 已有未过期 `content` 时跳过 Tika，并把纯文本回写到对方索引。
+- ingest-attachment 抽取上限调整为 200000 字符，便于 RAG 切片。
+- 运行情况说明计数含义，以及为何仍与 AIRAG 使用独立索引。
+
 ## 1.1.0
 
 - Align Kodbox search hook parameters with the official `docSearch` plugin.
