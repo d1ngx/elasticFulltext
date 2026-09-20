@@ -42,7 +42,13 @@ class KodboxCorpusShare {
 		);
 	}
 
-	public static function isFresh($doc, $modifyTime) {
+	public static function extractVersion() {
+		$cfg = self::pluginConfig('elasticFulltext');
+		$chars = max(100000, min(5000000, intval(_get($cfg, 'indexedChars', 1000000))));
+		return 'attachment-v2-'.$chars;
+	}
+
+	public static function isFresh($doc, $modifyTime, $extractVersion = null) {
 		if (!is_array($doc)) return false;
 		$content = (string)_get($doc, 'content', '');
 		if (trim($content) === '') return false;
@@ -50,6 +56,7 @@ class KodboxCorpusShare {
 		$modifyTime = intval($modifyTime);
 		// A legacy document without modifyTime cannot prove freshness for a dated file.
 		if ($modifyTime > 0 && ($docTime <= 0 || $docTime < $modifyTime)) return false;
+		if ($extractVersion !== null && (string)_get($doc, 'extractVersion', '') !== (string)$extractVersion) return false;
 		return true;
 	}
 
