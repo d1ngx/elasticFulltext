@@ -41,6 +41,7 @@ class KodboxElasticClient {
 						'name' => array('type' => 'text'), 'ext' => array('type' => 'keyword'),
 						'size' => array('type' => 'long'), 'modifyTime' => array('type' => 'date', 'format' => 'epoch_second'),
 						'content' => array('type' => 'text'), 'extractVersion' => array('type' => 'keyword'),
+						'ancestorIDs' => array('type' => 'long'),
 					),
 				),
 			));
@@ -52,6 +53,13 @@ class KodboxElasticClient {
 				'extractVersion' => array('type' => 'keyword'),
 			)), array(200));
 		}
+		$ancestors = $this->request('GET', '/'.$this->index.'/_mapping/field/ancestorIDs', null, array(200, 404), 5);
+		$ancestorMap = (array)_get((array)_get($ancestors, $this->index, array()), 'mappings', array());
+		if ($ancestors['_status'] === 404 || !isset($ancestorMap['ancestorIDs'])) {
+			$this->request('PUT', '/'.$this->index.'/_mapping', array('properties' => array(
+				'ancestorIDs' => array('type' => 'long'),
+			)), array(200));
+		}
 		return true;
 	}
 
@@ -61,6 +69,7 @@ class KodboxElasticClient {
 			'name' => (string)$source['name'], 'ext' => strtolower((string)$source['fileType']),
 			'size' => intval($source['size']), 'modifyTime' => intval($source['modifyTime']),
 			'extractVersion' => $this->extractionVersion(),
+			'ancestorIDs' => array_values(array_unique(array_filter(array_map('intval', (array)_get($source, 'ancestorIDs', array()))))),
 		);
 		$path = '/'.$this->index.'/_doc/'.intval($source['fileID']).'?refresh=false';
 		if ($plainText) $document['content'] = $this->limitText($this->toUtf8($content));
@@ -71,9 +80,15 @@ class KodboxElasticClient {
 		return $this->request('PUT', $path, $document, array(200, 201), $plainText ? 20 : 35);
 	}
 
-	public function search($words, $limit) {
+	public function search($words, $limit, $fileIDs = null, $ancestorID = 0) {
+		$ids = null;
+		if (is_array($fileIDs)) {
+			$ids = array_values(array_unique(array_filter(array_map('intval', $fileIDs))));
+			if (!$ids) return array();
+		}
 		$body = array(
 			'size' => max(1, intval($limit)),
+			'track_total_hits' => false,
 			'_source' => array('fileID'),
 			// “文件内容”搜索只匹配正文，与官方 docSearch 的 MATCH(content) 行为一致。
 			'query' => array('bool' => array(
@@ -83,26 +98,88 @@ class KodboxElasticClient {
 				),
 				'minimum_should_match' => 1,
 			)),
-			'highlight' => array(
-				'pre_tags' => array(''), 'post_tags' => array(''),
-				'fields' => array('content' => array('fragment_size' => 260, 'number_of_fragments' => 1), 'name' => array('number_of_fragments' => 0)),
-			),
 		);
-		$response = $this->request('POST', '/'.$this->index.'/_search', $body);
+		$filter = array();
+		if ($ids) $filter[] = array('terms' => array('fileID' => $ids));
+		if (intval($ancestorID) > 0) $filter[] = array('term' => array('ancestorIDs' => intval($ancestorID)));
+		if ($filter) $body['query']['bool']['filter'] = $filter;
+		$response = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
 		$result = array();
 		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
 			$source = (array)_get($hit, '_source', array());
-			$highlight = (array)_get($hit, 'highlight', array());
-			$snippet = '';
-			if (!empty($highlight['content'][0])) $snippet = $highlight['content'][0];
-			else if (!empty($highlight['name'][0])) $snippet = $highlight['name'][0];
-			$result[] = array('fileID' => intval(_get($source, 'fileID', _get($hit, '_id', 0))), 'snippet' => $snippet);
+			$result[] = array('fileID' => intval(_get($source, 'fileID', _get($hit, '_id', 0))), 'snippet' => '', 'score' => floatval(_get($hit, '_score', 0)));
 		}
 		return $result;
 	}
 
+	// 只翻还没写上祖先字段的旧文档。字段补齐后这一页为空，目录搜索不再扫全库。
+	public function searchPage($words, $size, $searchAfter = null, $missingAncestors = false) {
+		$body = array(
+			'size' => max(1, min(300, intval($size))),
+			'track_total_hits' => false,
+			'_source' => array('fileID'),
+			'sort' => array(array('_score' => 'desc'), array('fileID' => 'asc')),
+			'query' => array('bool' => array(
+				'should' => array(
+					array('match_phrase' => array('content' => array('query' => (string)$words, 'boost' => 3))),
+					array('match' => array('content' => array('query' => (string)$words, 'operator' => 'and'))),
+				),
+				'minimum_should_match' => 1,
+			)),
+		);
+		if ($missingAncestors) $body['query']['bool']['filter'] = array(array('bool' => array('must_not' => array(array('exists' => array('field' => 'ancestorIDs'))))));
+		if (is_array($searchAfter) && count($searchAfter) >= 2) $body['search_after'] = array($searchAfter[0], intval($searchAfter[1]));
+		$response = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
+		$hits = array();
+		$after = null;
+		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
+			$source = (array)_get($hit, '_source', array());
+			$fileID = intval(_get($source, 'fileID', _get($hit, '_id', 0)));
+			$sort = (array)_get($hit, 'sort', array());
+			if ($fileID) $hits[] = array('fileID' => $fileID, 'snippet' => '', 'score' => floatval(_get($hit, '_score', 0)));
+			if (count($sort) >= 2) $after = array($sort[0], intval($sort[1]));
+		}
+		return array('hits' => $hits, 'after' => $after, 'more' => count($hits) >= $body['size']);
+	}
+
+	public function snippets($words, $fileIDs) {
+		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
+		$ids = array_slice($ids, 0, 40);
+		if (!$ids || trim((string)$words) === '') return array();
+		$body = array(
+			'size' => count($ids),
+			'track_total_hits' => false,
+			'_source' => array('fileID'),
+			'query' => array('bool' => array(
+				'filter' => array(array('terms' => array('fileID' => $ids))),
+				'must' => array('bool' => array(
+					'should' => array(
+						array('match_phrase' => array('content' => array('query' => (string)$words, 'boost' => 3))),
+						array('match' => array('content' => array('query' => (string)$words, 'operator' => 'and'))),
+					),
+					'minimum_should_match' => 1,
+				)),
+			)),
+			'highlight' => array(
+				'max_analyzed_offset' => 40000,
+				'pre_tags' => array(''),
+				'post_tags' => array(''),
+				'fields' => array('content' => array('fragment_size' => 220, 'number_of_fragments' => 1)),
+			),
+		);
+		$response = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
+		$out = array();
+		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
+			$source = (array)_get($hit, '_source', array());
+			$fileID = intval(_get($source, 'fileID', _get($hit, '_id', 0)));
+			$snippet = (string)_get(_get((array)_get($hit, 'highlight', array()), 'content', array()), 0, '');
+			if ($fileID && $snippet !== '') $out[$fileID] = $snippet;
+		}
+		return $out;
+	}
+
 	public function getDocument($fileID) {
-		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,modifyTime,name,size,sourceID,ext,extractVersion', null, array(200, 404), 8);
+		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,modifyTime,name,size,sourceID,ext,extractVersion,ancestorIDs', null, array(200, 404), 8);
 		if ($result['_status'] === 404) return array();
 		return $this->normalizeDocument($result);
 	}
@@ -110,7 +187,7 @@ class KodboxElasticClient {
 	public function getDocuments($fileIDs) {
 		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
 		if (!$ids) return array();
-		$result = $this->request('POST', '/'.$this->index.'/_mget?_source_includes=content,modifyTime,name,size,sourceID,ext,extractVersion', array('ids' => $ids), array(200), 15);
+		$result = $this->request('POST', '/'.$this->index.'/_mget?_source_includes=content,modifyTime,name,size,sourceID,ext,extractVersion,ancestorIDs', array('ids' => $ids), array(200), 15);
 		$documents = array();
 		foreach ((array)_get($result, 'docs', array()) as $doc) {
 			$id = intval(_get($doc, '_id', 0));
@@ -130,6 +207,7 @@ class KodboxElasticClient {
 			'ext' => strtolower((string)_get($source, 'fileType', '')),
 			'size' => intval(_get($source, 'size', 0)),
 			'modifyTime' => intval(_get($source, 'modifyTime', 0)),
+			'ancestorIDs' => array_values(array_unique(array_filter(array_map('intval', (array)_get($source, 'ancestorIDs', array()))))),
 		);
 		return $this->request('POST', '/'.$this->index.'/_update/'.$fileID.'?refresh=false', array('doc' => $doc), array(200), 12);
 	}
@@ -232,6 +310,7 @@ class KodboxElasticClient {
 			'sourceID' => intval(_get($source, 'sourceID', 0)),
 			'ext' => strtolower((string)_get($source, 'ext', '')),
 			'extractVersion' => (string)_get($source, 'extractVersion', ''),
+			'ancestorIDs' => array_values(array_unique(array_filter(array_map('intval', (array)_get($source, 'ancestorIDs', array()))))),
 		);
 	}
 }

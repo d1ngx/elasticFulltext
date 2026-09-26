@@ -19,9 +19,19 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function bindHooks() {
+		$this->bindSearchHooks();
+		Hook::bind('explorer.list.path.before', 'elasticFulltextPlugin.bindSearchHooks');
+	}
+
+	public function bindSearchHooks() {
+		Hook::unbind('explorer.listSearch.searchDataBefore', 'elasticFulltextPlugin.searchBefore');
+		Hook::unbind('explorer.listSearch.searchDataAfter', 'elasticFulltextPlugin.searchAfter');
+		Hook::unbind('explorer.listSearch.fileContentText', 'elasticFulltextPlugin.fileContentText');
+		Hook::unbind('explorer.list.path.parse', 'elasticFulltextPlugin.listPathParse');
 		Hook::bind('explorer.listSearch.searchDataBefore', 'elasticFulltextPlugin.searchBefore');
 		Hook::bind('explorer.listSearch.searchDataAfter', 'elasticFulltextPlugin.searchAfter');
 		Hook::bind('explorer.listSearch.fileContentText', 'elasticFulltextPlugin.fileContentText');
+		Hook::bind('explorer.list.path.parse', 'elasticFulltextPlugin.listPathParse');
 	}
 
 	public function echoJs() {
@@ -71,11 +81,14 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function searchBefore($param) {
-		if (!$this->isOpen()) return $param;
-		if (!is_array($param) || empty($param['words']) || !in_array('content', (array)_get($param, 'option', array()), true)) return $param;
-		if (strlen($param['words']) <= 1 || empty($param['parentID'])) return $param;
+		if (!$this->isOpen()) return;
+		if (!is_array($param) || empty($param['words']) || !in_array('content', (array)_get($param, 'option', array()), true)) return;
+		if (strlen($param['words']) <= 1 || empty($param['parentID'])) return;
+		include_once($this->pluginPath.'lib/CorpusShare.class.php');
+		$level = ob_get_level();
+		ob_start();
 		try {
-			$result = $this->client()->search($param['words'], 1000);
+			$result = $this->searchInFolder($param['words'], 1000, intval($param['parentID']));
 			$fileIDs = array();
 			$this->snippets = array();
 			$this->matchedFileIDs = array();
@@ -88,43 +101,58 @@ class elasticFulltextPlugin extends PluginBase {
 			}
 			// 与官方 docSearch 一致：保留 words 和 content，仅附加候选物理 fileID。
 			// Kodbox Source::listSearch 会继续应用目录、类型、时间和用户权限过滤。
-			$param['fileID'] = $fileIDs ? array_values(array_unique($fileIDs)) : array(-1);
-			$param['_elasticFulltext'] = 1;
+			$param = KodboxCorpusShare::takeContentHits($param, $fileIDs, $this->snippets, 'elasticFulltext');
 		} catch (Throwable $e) {
 			$this->log('search failed: '.$e->getMessage(), 'error');
+			while (ob_get_level() > $level) @ob_end_clean();
+			return;
 		}
+		while (ob_get_level() > $level) @ob_end_clean();
 		return $param;
 	}
 
 	public function searchAfter($param, $listData) {
-		if (empty($param['_elasticFulltext']) || !is_array($listData)) return $listData;
-		if (!isset($listData['fileList']) || !is_array($listData['fileList'])) return $listData;
-		$filtered = array();
-		foreach ($listData['fileList'] as $item) {
-			$fileID = intval(_get($item, 'fileID', 0));
-			if (!$fileID || !isset($this->matchedFileIDs[$fileID])) continue;
-			if (isset($this->snippets[$fileID])) $item['searchContentMatch'] = $this->snippets[$fileID];
-			$filtered[] = $item;
+		include_once($this->pluginPath.'lib/CorpusShare.class.php');
+		$applied = KodboxCorpusShare::applyContentHits($listData);
+		if ($applied) $listData = $applied;
+		elseif (!KodboxCorpusShare::contentHits()) return;
+		$ids = array();
+		foreach ((array)_get($listData, 'fileList', array()) as $item) {
+			$id = intval(_get($item, 'fileID', _get($item, 'fileInfo.fileID', 0)));
+			if ($id) $ids[] = $id;
 		}
-		$listData['fileList'] = $filtered;
-		$listData['folderList'] = array();
-		if (!isset($listData['pageInfo']) || !is_array($listData['pageInfo'])) $listData['pageInfo'] = array();
-		$listData['pageInfo']['totalNum'] = count($filtered);
-		$listData['pageInfo']['pageTotal'] = 1;
-		$listData['disableSort'] = 1;
+		$words = (string)_get($param, 'words', '');
+		if ($ids && $words !== '') {
+			try {
+				$clean = array();
+				foreach ($this->client()->snippets($words, $ids) as $id => $text) {
+					$text = $this->sanitizeSnippet($text);
+					if ($text !== '') $clean[intval($id)] = $text;
+				}
+				if ($clean) {
+					KodboxCorpusShare::putSnippets($clean);
+					$listData = KodboxCorpusShare::overlaySnippets($listData);
+				}
+			} catch (Throwable $e) {}
+		}
 		return $listData;
+	}
+
+	public function listPathParse($data) {
+		include_once($this->pluginPath.'lib/CorpusShare.class.php');
+		return KodboxCorpusShare::overlaySnippets($data);
 	}
 
 	// 兼容 Kodbox 对物理路径及其他插件发起的正文读取。
 	public function fileContentText($file, $makeNow = false) {
-		if (!$this->isOpen()) return false;
+		if (!$this->isOpen()) return;
 		$fileID = intval(_get((array)$file, 'fileID', 0));
-		if (!$fileID) return false;
+		if (!$fileID) return;
 		try {
 			$content = $this->client()->getContent($fileID);
-			return $content !== '' ? $content : false;
+			return $content !== '' ? $content : null;
 		} catch (Throwable $e) {
-			return false;
+			return;
 		}
 	}
 
@@ -203,18 +231,26 @@ class elasticFulltextPlugin extends PluginBase {
 		foreach ((array)$failedRows as $failedRow) {
 			ElasticFulltextBackpressure::assertReady(array());
 			if (microtime(true) >= $deadline) break;
-			$file = Model('File')->where(array('fileID' => intval($failedRow['fileID'])))->find();
-			$ext = $file ? strtolower(get_path_ext(_get($file, 'name', ''))) : '';
-			if ($file && in_array($ext, $extensions, true)) {
-				$this->writeCursor($cursor, array(
-					'running' => 1, 'current' => (string)_get($file, 'name', ''), 'started' => $startedAt,
-					'indexed' => $processed, 'skipped' => $skipped, 'failed' => $failed, 'scanned' => $scanned, 'ignored' => $ignored,
-				));
-				$result = $this->indexFileRecord($file, $ext, $client, $config, null);
-				if ($result === 'ok') $processed++;
-				else if ($result === 'skip') $skipped++;
-				else if ($result === 'fail') $failed++;
+			$fileID = intval($failedRow['fileID']);
+			$file = Model('File')->where(array('fileID' => $fileID))->find();
+			if (!$file) {
+				try { $client->deleteFile($fileID); } catch (Throwable $e) {}
+				Model($this->stateTable)->where(array('fileID' => $fileID))->delete();
+				continue;
 			}
+			$ext = strtolower(get_path_ext(_get($file, 'name', '')));
+			if (!$ext || !in_array($ext, $extensions, true)) {
+				$this->saveState($file, 2, '扩展名已不在索引范围');
+				continue;
+			}
+			$this->writeCursor($cursor, array(
+				'running' => 1, 'current' => (string)_get($file, 'name', ''), 'started' => $startedAt,
+				'indexed' => $processed, 'skipped' => $skipped, 'failed' => $failed, 'scanned' => $scanned, 'ignored' => $ignored,
+			));
+			$result = $this->indexFileRecord($file, $ext, $client, $config, null);
+			if ($result === 'ok') $processed++;
+			else if ($result === 'skip') $skipped++;
+			else if ($result === 'fail') $failed++;
 		}
 		// 官方 docSearch 以 io_file 为扫描源。物理 fileID 天然去重。
 		// 图片等非目标格式不计入批次，一直扫到真正索引满 batch 或用完时间窗口。
@@ -264,8 +300,9 @@ class elasticFulltextPlugin extends PluginBase {
 			}
 		}
 		$maxID = intval(Model('File')->max('fileID'));
-		$complete = $wrapped && $processed === 0;
-		if ($complete || $cursor > $maxID) $cursor = $maxID;
+		if ($cursor > $maxID) $cursor = $maxID;
+		// 只有真正走到最后一个文件、且本轮没有新入库，才算扫完。绕回后只走了一段时保留游标，后面的文件下一轮继续刷新目录位置。
+		$complete = $processed === 0 && $maxID > 0 && $cursor >= $maxID;
 		$this->writeCursor($cursor, array(
 			'indexed' => $processed, 'skipped' => $skipped, 'failed' => $failed,
 			'scanned' => $scanned, 'ignored' => $ignored, 'running' => 0, 'current' => '',
@@ -296,6 +333,7 @@ class elasticFulltextPlugin extends PluginBase {
 			$document = $file;
 			$document['sourceID'] = intval(_get($file, 'sourceID', 0));
 			$document['fileType'] = $ext;
+			$document['ancestorIDs'] = KodboxCorpusShare::ancestorIDs($fileID);
 			$origin = '';
 			$ownDoc = is_array($knownDoc) ? $knownDoc : array();
 			if ($knownDoc === null) {
@@ -643,11 +681,84 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	private function documentMetadataMatches($doc, $file) {
+		$left = array_values(array_unique(array_filter(array_map('intval', (array)_get($doc, 'ancestorIDs', array())))));
+		$right = array_values(array_unique(array_filter(array_map('intval', (array)_get($file, 'ancestorIDs', array())))));
+		sort($left);
+		sort($right);
 		return intval(_get($doc, 'modifyTime', 0)) >= intval(_get($file, 'modifyTime', 0))
 			&& intval(_get($doc, 'size', -1)) === intval(_get($file, 'size', 0))
 			&& intval(_get($doc, 'sourceID', -1)) === intval(_get($file, 'sourceID', 0))
 			&& (string)_get($doc, 'name', '') === (string)_get($file, 'name', '')
-			&& strtolower((string)_get($doc, 'ext', '')) === strtolower((string)_get($file, 'fileType', ''));
+			&& strtolower((string)_get($doc, 'ext', '')) === strtolower((string)_get($file, 'fileType', ''))
+			&& $left === $right;
+	}
+
+	private function searchInFolder($words, $limit, $parentID) {
+		$client = $this->client();
+		if (!$parentID) return $client->search($words, $limit);
+		$scope = KodboxCorpusShare::folderFileIDs($parentID, 4000);
+		if (!empty($scope['complete'])) {
+			$ids = (array)_get($scope, 'ids', array());
+			if (!$ids) return array();
+			return $client->search($words, $limit, $ids);
+		}
+		$raw = $client->search($words, $limit, null, $parentID);
+		$hits = $this->hitsInside($parentID, $raw);
+		if (count($raw) >= $limit && count($hits) < count($raw)) {
+			$raw = $client->search($words, min(2000, $limit * 2), null, $parentID);
+			$hits = array_slice($this->hitsInside($parentID, $raw), 0, $limit);
+		}
+		$seen = array();
+		foreach ($hits as $hit) $seen[intval($hit['fileID'])] = true;
+		$after = null;
+		for ($i = 0; $i < 4; $i++) {
+			$page = $client->searchPage($words, 200, $after, true);
+			if (empty($page['hits'])) break;
+			$after = _get($page, 'after', null);
+			$worst = -1;
+			if (count($hits) >= $limit) {
+				$worst = floatval(_get($hits[0], 'score', 0));
+				foreach ($hits as $hit) {
+					$score = floatval(_get($hit, 'score', 0));
+					if ($score < $worst) $worst = $score;
+				}
+			}
+			if ($worst >= 0 && floatval(_get($page['hits'][0], 'score', 0)) <= $worst) break;
+			$ids = array();
+			foreach ($page['hits'] as $hit) {
+				if ($worst >= 0 && floatval(_get($hit, 'score', 0)) <= $worst) break;
+				$ids[] = intval($hit['fileID']);
+			}
+			$allow = array_flip(KodboxCorpusShare::keepInFolder($parentID, $ids));
+			foreach ($page['hits'] as $hit) {
+				$id = intval($hit['fileID']);
+				if (!$id || isset($seen[$id]) || !isset($allow[$id])) continue;
+				if ($worst >= 0 && floatval(_get($hit, 'score', 0)) <= $worst) break;
+				$seen[$id] = true;
+				$hits[] = $hit;
+			}
+			usort($hits, function($a, $b) {
+				$sa = floatval(_get($a, 'score', 0));
+				$sb = floatval(_get($b, 'score', 0));
+				if ($sa == $sb) return intval($a['fileID']) - intval($b['fileID']);
+				return $sa > $sb ? -1 : 1;
+			});
+			if (count($hits) > $limit) $hits = array_slice($hits, 0, $limit);
+			if (empty($page['more'])) break;
+		}
+		return $hits;
+	}
+
+	private function hitsInside($parentID, $hits) {
+		$ids = array();
+		foreach ((array)$hits as $hit) $ids[] = intval(_get($hit, 'fileID', 0));
+		$allow = array_flip(KodboxCorpusShare::keepInFolder($parentID, $ids));
+		$out = array();
+		foreach ((array)$hits as $hit) {
+			$id = intval(_get($hit, 'fileID', 0));
+			if ($id && isset($allow[$id])) $out[] = $hit;
+		}
+		return $out;
 	}
 
 	private function recoverStaleRun() {
@@ -785,13 +896,17 @@ class elasticFulltextPlugin extends PluginBase {
 
 	private function sanitizeSnippet($text) {
 		$text = html_entity_decode(strip_tags((string)$text), ENT_QUOTES, 'UTF-8');
-		$text = str_replace(array("\0", '&nbsp;', '&quot;'), array('', ' ', '"'), $text);
+		$text = str_replace(array("\0", '&nbsp;', '&quot;', '<', '>'), array('', ' ', '"', ' ', ' '), $text);
 		$text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]+/', '', $text);
-		$text = preg_replace("/\r\n|\r/", "\n", $text);
-		$text = preg_replace("/\n{2,}/", "\n", $text);
-		$text = preg_replace('/[ \t]{2,}/', ' ', $text);
-		$text = trim($text, " \t\r\n\f");
-		return function_exists('utf8Repair') ? utf8Repair($text) : $text;
+		$text = preg_replace('/\s+/u', ' ', $text);
+		$text = trim((string)$text);
+		if (function_exists('utf8Repair')) $text = utf8Repair($text);
+		if (function_exists('mb_substr')) {
+			if (mb_strlen($text, 'UTF-8') > 300) $text = mb_substr($text, 0, 300, 'UTF-8').'...';
+		} elseif (strlen($text) > 900) {
+			$text = substr($text, 0, 900).'...';
+		}
+		return $text;
 	}
 
 	private function escape($value) {return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');}
