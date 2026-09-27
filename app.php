@@ -206,16 +206,22 @@ class elasticFulltextPlugin extends PluginBase {
 		if (function_exists('ignore_timeout')) ignore_timeout();
 		else @set_time_limit($budget + 30);
 		$extensions = $this->configuredExtensions($config);
-		if (!$extensions) return 0;
+
 		$cursorData = $this->readCursorData();
 		$corpusHash = $this->corpusFingerprint($config);
 		$scanHash = $this->scanFingerprint($config);
 		$cursor = intval(_get($cursorData, 'fileID', 0));
 		if (_get($cursorData, 'corpusHash', '') !== $corpusHash || _get($cursorData, 'scanHash', '') !== $scanHash) {
 			$cursor = 0;
-			$this->writeCursor(0, array('complete' => 0, 'completeMax' => 0, 'corpusHash' => $corpusHash, 'scanHash' => $scanHash));
+			$this->writeCursor(0, array('complete' => 0, 'completeMax' => 0, 'corpusHash' => $corpusHash, 'scanHash' => $scanHash, 'policyCleanupPending' => 1));
 		}
 		$deadline = microtime(true) + $budget;
+		if (!empty($this->readCursorData()['policyCleanupPending'])) {
+			ElasticFulltextBackpressure::assertReady(array());
+			$purged = $client->purgeExcluded($batch * 2);
+			$this->writeCursor($cursor, array('policyCleanupPending' => $purged >= $batch * 2 ? 1 : 0));
+		}
+		if (!$extensions) { $this->cleanupDeleted($client, $batch * 2); return 0; }
 		$startedAt = intval(_get($this->readCursorData(), 'started', 0));
 		if ($startedAt <= 0) $startedAt = time();
 		$processed = 0;
@@ -234,7 +240,7 @@ class elasticFulltextPlugin extends PluginBase {
 			$fileID = intval($failedRow['fileID']);
 			$file = Model('File')->where(array('fileID' => $fileID))->find();
 			if (!$file) {
-				try { $client->deleteFile($fileID); } catch (Throwable $e) {}
+				try { $client->deleteFile($fileID); } catch (Throwable $e) { continue; }
 				Model($this->stateTable)->where(array('fileID' => $fileID))->delete();
 				continue;
 			}
@@ -317,18 +323,20 @@ class elasticFulltextPlugin extends PluginBase {
 		$fileID = intval(_get($file, 'fileID', 0));
 		$modifyTime = intval(_get($file, 'modifyTime', 0));
 		if (!$fileID) return false;
-		$maxBytes = intval(_get($config, 'maxFileSizeMB', 30)) * 1024 * 1024;
-		if (intval(_get($file, 'size', 0)) <= 0) {
-			$this->saveState($file, 2, '空文件');
-			$this->log('skip '.$this->fileLabel($file).' 空文件', 'warning');
-			return 'skip';
-		}
-		if (intval(_get($file, 'size', 0)) >= $maxBytes) {
-			$this->saveState($file, 2, '超过大小限制');
-			$this->log('skip '.$this->fileLabel($file).' 超过大小限制', 'warning');
-			return 'skip';
-		}
 		try {
+			$maxBytes = intval(_get($config, 'maxFileSizeMB', 30)) * 1024 * 1024;
+			if (intval(_get($file, 'size', 0)) <= 0) {
+				if ($knownDoc === null || $knownDoc) $client->deleteFile($fileID);
+				$this->saveState($file, 2, '空文件');
+				$this->log('skip '.$this->fileLabel($file).' 空文件', 'warning');
+				return 'skip';
+			}
+			if (intval(_get($file, 'size', 0)) >= $maxBytes) {
+				if ($knownDoc === null || $knownDoc) $client->deleteFile($fileID);
+				$this->saveState($file, 2, '超过大小限制');
+				$this->log('skip '.$this->fileLabel($file).' 超过大小限制', 'warning');
+				return 'skip';
+			}
 			include_once($this->pluginPath.'lib/CorpusShare.class.php');
 			$document = $file;
 			$document['sourceID'] = intval(_get($file, 'sourceID', 0));
@@ -336,11 +344,13 @@ class elasticFulltextPlugin extends PluginBase {
 			$document['ancestorIDs'] = KodboxCorpusShare::ancestorIDs($fileID);
 			$origin = '';
 			$ownDoc = is_array($knownDoc) ? $knownDoc : array();
-			if ($knownDoc === null) {
+			if ($knownDoc === null || ($ownDoc && _get($ownDoc, 'contentReady', null) === null)) {
 				try { $ownDoc = $client->getDocument($fileID); } catch (Throwable $e) { $ownDoc = array(); }
 			}
-			if (KodboxCorpusShare::isFresh($ownDoc, $modifyTime) && _get($ownDoc, 'extractVersion', '') === $client->extractionVersion()) {
-				if ($this->documentMetadataMatches($ownDoc, $document)) {
+			if (($modifyTime <= 0 || intval(_get($ownDoc, 'modifyTime', 0)) >= $modifyTime) &&
+				(_get($ownDoc, 'contentReady', null) === true || KodboxCorpusShare::isFresh($ownDoc, $modifyTime)) &&
+				_get($ownDoc, 'extractVersion', '') === $client->extractionVersion()) {
+				if ($this->documentMetadataMatches($ownDoc, $document) && _get($ownDoc, 'contentReady', null) === true) {
 					$origin = 'fulltext';
 				} else {
 					$client->updateMetadata($document);
@@ -420,16 +430,22 @@ class elasticFulltextPlugin extends PluginBase {
 		foreach ((array)$states as $state) $ids[] = intval($state['fileID']);
 		$alive = array();
 		if ($ids) {
-			$rows = Model('File')->where(array('fileID' => array('in', $ids)))->field('fileID')->select();
-			foreach ((array)$rows as $row) $alive[intval($row['fileID'])] = true;
+			$rows = Model('File')->where(array('fileID' => array('in', $ids)))->field('fileID,name,size,modifyTime')->select();
+			foreach ((array)$rows as $row) $alive[intval($row['fileID'])] = $row;
 		}
+		$config = $this->getConfig();
+		$extensions = $this->configuredExtensions($config);
+		$maxBytes = max(1, intval(_get($config, 'maxFileSizeMB', 30))) * 1024 * 1024;
 		foreach ((array)$states as $state) {
 			$fileID = intval($state['fileID']);
 			$cleanupCursor = max($cleanupCursor, $fileID);
-			if (isset($alive[$fileID])) continue;
+			$file = isset($alive[$fileID]) ? $alive[$fileID] : null;
+			if ($file && intval($file['size']) > 0 && intval($file['size']) < $maxBytes && in_array(strtolower(get_path_ext($file['name'])), $extensions, true)) continue;
+			if ($file && intval($state['status']) === 2) continue;
 			try {
 				$client->deleteFile($fileID);
-				Model($this->stateTable)->where(array('fileID' => $fileID))->delete();
+				if ($file) $this->saveState($file, 2, '当前索引策略已排除');
+				else Model($this->stateTable)->where(array('fileID' => $fileID))->delete();
 			} catch (Throwable $e) {
 				$this->log('delete retry fileID='.$fileID.' '.$e->getMessage(), 'error');
 			}
@@ -675,6 +691,7 @@ class elasticFulltextPlugin extends PluginBase {
 
 	private function scanFingerprint($config) {
 		return sha1(json_encode(array(
+			'policyVersion' => 2,
 			'extensions' => $this->configuredExtensions($config),
 			'maxFileSizeMB' => max(1, min(500, intval(_get($config, 'maxFileSizeMB', 30)))),
 		)));
@@ -774,6 +791,7 @@ class elasticFulltextPlugin extends PluginBase {
 		$this->initTable();
 		$config = $this->getConfig();
 		$cursorData = $this->readCursorData();
+		if (!empty($cursorData['policyCleanupPending'])) return true;
 		if (_get($cursorData, 'corpusHash', '') !== $this->corpusFingerprint($config) ||
 			_get($cursorData, 'scanHash', '') !== $this->scanFingerprint($config)) return true;
 		if (intval(Model($this->stateTable)->where(array('status' => 3, 'indexTime' => array('lt', time() - 900)))->count()) > 0) return true;
@@ -858,7 +876,7 @@ class elasticFulltextPlugin extends PluginBase {
 	private function writeCursor($fileID, $extra = null) {
 		$prev = $this->readCursorData();
 		$data = array('fileID' => intval($fileID), 'time' => time());
-		foreach (array('indexed', 'skipped', 'failed', 'scanned', 'ignored', 'running', 'complete', 'completeMax', 'cleanupCursor') as $key) {
+		foreach (array('indexed', 'skipped', 'failed', 'scanned', 'ignored', 'running', 'complete', 'completeMax', 'cleanupCursor', 'policyCleanupPending') as $key) {
 			$data[$key] = is_array($extra) && array_key_exists($key, $extra) ? intval($extra[$key]) : intval(_get($prev, $key, 0));
 		}
 		foreach (array('corpusHash', 'scanHash') as $key) {

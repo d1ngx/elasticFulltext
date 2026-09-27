@@ -2,7 +2,7 @@
 
 为网盘中的 PDF、Office、文本提供全文检索。权限和目录过滤仍由网盘完成，Elasticsearch `ingest-attachment`（Apache Tika）只负责抽正文和检索。
 
-当前版本 **1.5.0**。已在 Kodbox 1.69.03、Elasticsearch 8.19.4、Docker 环境下验证。
+当前版本 **1.5.7**。已在 Kodbox 1.69.03、Elasticsearch 8.19.4、Docker 环境下验证。
 
 ## 功能
 
@@ -84,3 +84,14 @@ curl -X DELETE http://elasticsearch:9200/kodbox-fulltext
 ```
 
 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+
+### 1.5.7 策略更新
+
+格式或大小限制收紧后，搜索、摘要和直接正文读取立即应用新条件。后台任务分批清理被排除的旧正文（每轮最多 `batchSize × 2` 篇），失败保留待清理标记；清理只操作 ES 索引，不删除原始文件。首次升级自动核对旧索引，无需手动重建。
+
+- `php plugins/elasticFulltext/tests/policy.php`：查询边界与清理断点。
+- `PLUGIN_AUDIT_ES_URL=http://elasticsearch:9200 php plugins/elasticFulltext/tests/integration-es.php`：可选真实 ES 验证，只创建和删除随机命名的测试索引；不设置环境变量时跳过。
+
+### 1.5.8 扫描内存优化
+
+批量扫描仅取元数据与正文就绪标记，旧文档首次检查时逐篇读取正文并补齐标记，避免一批正文同时驻留 PHP 内存。无需手动重建索引。新增 `tests/metadata-scan.php` 验证旧文档兼容及空正文重提取；真实 ES 测试同时验证纯文本和 Tika 提取，并清理随机测试索引与管道。

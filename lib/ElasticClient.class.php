@@ -6,13 +6,24 @@ class KodboxElasticClient {
 	private $pipeline;
 	private $indexedChars;
 	private $verifyTls;
+	private $policy;
 
 	public function __construct($config) {
 		$this->url = rtrim(_get($config, 'elasticUrl', 'http://elasticsearch:9200'), '/');
 		$this->index = strtolower(_get($config, 'indexName', 'kodbox-fulltext'));
 		$this->indexedChars = max(100000, min(5000000, intval(_get($config, 'indexedChars', 1000000))));
-		$this->pipeline = 'kodbox-attachment-'.$this->indexedChars;
+		$this->pipeline = 'kodbox-attachment-'.$this->indexedChars.'-meta-v1';
 		$this->verifyTls = _get($config, 'verifyTls', '1') == '1';
+		$parse = function($value) {
+			if (is_array($value)) $value = implode(',', $value);
+			return array_values(array_unique(array_filter(array_map(function($ext) { return preg_replace('/[^a-z0-9]/', '', $ext); }, preg_split('/[\s,;]+/', strtolower((string)$value))))));
+		};
+		$exts = $parse(_get($config, 'allowExtensions', ''));
+		if (_get($config, 'extensionMode', 'allow') === 'deny') $exts = array_values(array_diff($exts, $parse(_get($config, 'denyExtensions', ''))));
+		$this->policy = array(
+			$exts ? array('terms' => array('ext' => $exts)) : array('match_none' => new stdClass()),
+			array('range' => array('size' => array('gt' => 0, 'lt' => max(1, intval(_get($config, 'maxFileSizeMB', 30))) * 1024 * 1024))),
+		);
 	}
 
 	public function info($timeout = 5) {return $this->request('GET', '/', null, array(200), $timeout);}
@@ -27,6 +38,7 @@ class KodboxElasticClient {
 					array('attachment' => array('field' => 'data', 'target_field' => 'attachment', 'indexed_chars' => $this->indexedChars, 'remove_binary' => true)),
 					array('convert' => array('field' => 'attachment.content', 'target_field' => 'content', 'type' => 'string', 'ignore_failure' => true)),
 					array('remove' => array('field' => 'attachment', 'ignore_missing' => true)),
+					array('script' => array('source' => "ctx.contentReady = ctx.containsKey('content') && ctx.content != null && ctx.content.trim().length() > 0")),
 				),
 			));
 		}
@@ -72,8 +84,10 @@ class KodboxElasticClient {
 			'ancestorIDs' => array_values(array_unique(array_filter(array_map('intval', (array)_get($source, 'ancestorIDs', array()))))),
 		);
 		$path = '/'.$this->index.'/_doc/'.intval($source['fileID']).'?refresh=false';
-		if ($plainText) $document['content'] = $this->limitText($this->toUtf8($content));
-		else {
+		if ($plainText) {
+			$document['content'] = $this->limitText($this->toUtf8($content));
+			$document['contentReady'] = trim($document['content']) !== '';
+		} else {
 			$document['data'] = base64_encode($content);
 			$path .= '&pipeline='.$this->pipeline;
 		}
@@ -103,6 +117,7 @@ class KodboxElasticClient {
 		if ($ids) $filter[] = array('terms' => array('fileID' => $ids));
 		if (intval($ancestorID) > 0) $filter[] = array('term' => array('ancestorIDs' => intval($ancestorID)));
 		if ($filter) $body['query']['bool']['filter'] = $filter;
+		$body['query']['bool']['filter'] = array_merge((array)_get($body['query']['bool'], 'filter', array()), $this->policy);
 		$response = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
 		$result = array();
 		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
@@ -129,6 +144,7 @@ class KodboxElasticClient {
 		);
 		if ($missingAncestors) $body['query']['bool']['filter'] = array(array('bool' => array('must_not' => array(array('exists' => array('field' => 'ancestorIDs'))))));
 		if (is_array($searchAfter) && count($searchAfter) >= 2) $body['search_after'] = array($searchAfter[0], intval($searchAfter[1]));
+		$body['query']['bool']['filter'] = array_merge((array)_get($body['query']['bool'], 'filter', array()), $this->policy);
 		$response = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
 		$hits = array();
 		$after = null;
@@ -167,6 +183,7 @@ class KodboxElasticClient {
 				'fields' => array('content' => array('fragment_size' => 220, 'number_of_fragments' => 1)),
 			),
 		);
+		$body['query']['bool']['filter'] = array_merge((array)_get($body['query']['bool'], 'filter', array()), $this->policy);
 		$response = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
 		$out = array();
 		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $hit) {
@@ -179,7 +196,7 @@ class KodboxElasticClient {
 	}
 
 	public function getDocument($fileID) {
-		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,modifyTime,name,size,sourceID,ext,extractVersion,ancestorIDs', null, array(200, 404), 8);
+		$result = $this->request('GET', '/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,contentReady,modifyTime,name,size,sourceID,ext,extractVersion,ancestorIDs', null, array(200, 404), 8);
 		if ($result['_status'] === 404) return array();
 		return $this->normalizeDocument($result);
 	}
@@ -187,12 +204,14 @@ class KodboxElasticClient {
 	public function getDocuments($fileIDs) {
 		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
 		if (!$ids) return array();
-		$result = $this->request('POST', '/'.$this->index.'/_mget?_source_includes=content,modifyTime,name,size,sourceID,ext,extractVersion,ancestorIDs', array('ids' => $ids), array(200), 15);
+		$result = $this->request('POST', '/'.$this->index.'/_mget?_source_includes=contentReady,modifyTime,name,size,sourceID,ext,extractVersion,ancestorIDs', array('ids' => $ids), array(200), 15);
 		$documents = array();
 		foreach ((array)_get($result, 'docs', array()) as $doc) {
 			$id = intval(_get($doc, '_id', 0));
 			if (!$id) continue;
+			if (!empty($doc['error'])) throw new RuntimeException('无法读取 ES 文件元数据: '.$id);
 			$documents[$id] = !empty($doc['found']) ? $this->normalizeDocument((array)_get($doc, '_source', array())) : array();
+			unset($documents[$id]['content']);
 		}
 		return $documents;
 	}
@@ -202,6 +221,7 @@ class KodboxElasticClient {
 		if (!$fileID) return false;
 		$doc = array(
 			'fileID' => $fileID,
+			'contentReady' => true,
 			'sourceID' => intval(_get($source, 'sourceID', 0)),
 			'name' => (string)_get($source, 'name', ''),
 			'ext' => strtolower((string)_get($source, 'fileType', '')),
@@ -217,7 +237,17 @@ class KodboxElasticClient {
 	}
 
 	public function getContent($fileID) {
-		return (string)_get($this->getDocument($fileID), 'content', '');
+		$body = array('size' => 1, '_source' => array('content'), 'query' => array('bool' => array('filter' => array_merge($this->policy, array(array('term' => array('fileID' => intval($fileID))))))));
+		$result = $this->request('POST', '/'.$this->index.'/_search', $body, array(200), 8);
+		$hit = _get(_get(_get($result, 'hits', array()), 'hits', array()), 0, array());
+		return (string)_get(_get($hit, '_source', array()), 'content', '');
+	}
+
+	public function purgeExcluded($limit = 100) {
+		$body = array('query' => array('bool' => array('must_not' => array(array('bool' => array('filter' => $this->policy))))));
+		$result = $this->request('POST', '/'.$this->index.'/_delete_by_query?conflicts=proceed&refresh=false&max_docs='.max(1, intval($limit)), $body, array(200), 20);
+		if (!empty($result['failures']) || !empty($result['timed_out']) || !empty($result['version_conflicts'])) throw new RuntimeException('策略清理尚未完成，将在下轮重试');
+		return intval(_get($result, 'deleted', 0));
 	}
 
 	public function deleteFile($fileID) {$this->request('DELETE', '/'.$this->index.'/_doc/'.intval($fileID), null, array(200, 404));}
@@ -304,6 +334,7 @@ class KodboxElasticClient {
 	private function normalizeDocument($source) {
 		return array(
 			'content' => (string)_get($source, 'content', ''),
+			'contentReady' => array_key_exists('contentReady', $source) ? (bool)$source['contentReady'] : null,
 			'modifyTime' => intval(_get($source, 'modifyTime', 0)),
 			'name' => (string)_get($source, 'name', ''),
 			'size' => intval(_get($source, 'size', 0)),
