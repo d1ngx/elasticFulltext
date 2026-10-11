@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__.'/Security.class.php';
 
 class KodboxElasticClient {
 	private $url;
@@ -9,11 +10,11 @@ class KodboxElasticClient {
 	private $policy;
 
 	public function __construct($config) {
-		$this->url = rtrim(_get($config, 'elasticUrl', 'http://elasticsearch:9200'), '/');
+		$this->url = KodboxSearchSecurity::httpUrl(rtrim(_get($config, 'elasticUrl', 'http://elasticsearch:9200'), '/'));
 		$this->index = strtolower(_get($config, 'indexName', 'kodbox-fulltext'));
 		$this->indexedChars = max(100000, min(5000000, intval(_get($config, 'indexedChars', 1000000))));
 		$this->pipeline = 'kodbox-attachment-'.$this->indexedChars.'-meta-v1';
-		$this->verifyTls = _get($config, 'verifyTls', '1') == '1';
+		$this->verifyTls = true;
 		$parse = function($value) {
 			if (is_array($value)) $value = implode(',', $value);
 			return array_values(array_unique(array_filter(array_map(function($ext) { return preg_replace('/[^a-z0-9]/', '', $ext); }, preg_split('/[\s,;]+/', strtolower((string)$value))))));
@@ -266,6 +267,7 @@ class KodboxElasticClient {
 		if (!function_exists('curl_init')) throw new Exception('PHP cURL extension is required');
 		$curl = curl_init($this->url.$path);
 		$options = array(
+			CURLOPT_FOLLOWLOCATION => false, CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 			CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => true,
 			CURLOPT_CONNECTTIMEOUT => min(5, max(1, intval($timeout))), CURLOPT_TIMEOUT => max(1, intval($timeout)),
 			CURLOPT_HTTPHEADER => array('Content-Type: application/json'),

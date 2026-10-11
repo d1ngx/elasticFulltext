@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__.'/lib/Security.class.php';
 
 class elasticFulltextPlugin extends PluginBase {
 	private $stateTable = 'plugin_elastic_fulltext_state';
@@ -157,6 +158,9 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function task() {
+		if (defined('MOD') && strtolower(MOD) === 'plugin') {
+			if (!KodboxSearchSecurity::protect($this->in, true) || !KodUser::isRoot()) return;
+		}
 		return $this->runLocked(false);
 	}
 
@@ -387,7 +391,12 @@ class elasticFulltextPlugin extends PluginBase {
 		if (!$tmp || file_put_contents($tmp, $content) === false) {if ($tmp) @unlink($tmp); return $content;}
 		$zip = new ZipArchive();
 		if ($zip->open($tmp) !== true) {@unlink($tmp); return $content;}
-		$types = (string)$zip->getFromName('[Content_Types].xml');
+		$typesStat = $zip->statName('[Content_Types].xml');
+		if ($zip->numFiles > 10000 || ($typesStat && $typesStat['size'] > 1048576)) {
+			$zip->close(); @unlink($tmp);
+			throw new RuntimeException('Office 压缩包条目过多或内容类型声明超过 1 MB');
+		}
+		$types = (string)$zip->getFromName('[Content_Types].xml', 1048576);
 		$removed = 0;
 		for ($i = $zip->numFiles - 1; $i >= 0; $i--) {
 			$name = $zip->getNameIndex($i);
@@ -454,6 +463,7 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function manage() {
+		if (!KodboxSearchSecurity::protect($this->in, true)) return;
 		if (_get($_SERVER, 'REQUEST_METHOD', '') !== 'POST') return show_json(LNG('common.illegalRequest'), false);
 		if (!KodUser::isRoot()) return show_json(LNG('explorer.noPermissionAction'), false);
 		$this->releaseSession();
@@ -516,6 +526,7 @@ class elasticFulltextPlugin extends PluginBase {
 	}
 
 	public function status() {
+		if (!KodboxSearchSecurity::protect($this->in, false)) return;
 		if (!KodUser::isRoot()) return show_json(LNG('explorer.noPermissionAction'), false);
 		$this->releaseSession();
 		$fast = intval(_get($_GET, 'fast', 0)) === 1;

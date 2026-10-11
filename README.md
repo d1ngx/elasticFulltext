@@ -95,3 +95,7 @@ curl -X DELETE http://elasticsearch:9200/kodbox-fulltext
 ### 1.5.8 扫描内存优化
 
 批量扫描仅取元数据与正文就绪标记，旧文档首次检查时逐篇读取正文并补齐标记，避免一批正文同时驻留 PHP 内存。无需手动重建索引。新增 `tests/metadata-scan.php` 验证旧文档兼容及空正文重提取；真实 ES 测试同时验证纯文本和 Tika 提取，并清理随机测试索引与管道。
+
+### 1.5.9 安全与功能修复
+
+补齐插件请求防护，收紧网络、上传与 Office ZIP 边界。升级后刷新前端；自定义已认证 API 请求需增加 `X-Kodbox-Plugin: 1`。详见 [SECURITY_AUDIT.md](SECURITY_AUDIT.md)，包含代码证据、风险等级、修复方案和测试。

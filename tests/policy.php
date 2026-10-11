@@ -12,7 +12,9 @@ function curl_exec($ch){Wire::$url=$ch->url;Wire::$body=json_decode($ch->options
 function curl_getinfo($ch,$key){return 200;}
 function curl_close($ch){}
 $source=file_get_contents(__DIR__.'/../lib/ElasticClient.class.php');
-eval('namespace FulltextPolicyTest; use Exception; use RuntimeException; use stdClass; '.substr($source,5));
+$source=preg_replace('/require_once __DIR__[^;]+;/', '', $source);
+require_once __DIR__.'/../lib/Security.class.php';
+eval('namespace FulltextPolicyTest; use \KodboxSearchSecurity; use Exception; use RuntimeException; use stdClass; '.substr($source,5));
 $client=new KodboxElasticClient(array('elasticUrl'=>'http://example.invalid','allowExtensions'=>'txt,pdf','extensionMode'=>'deny','denyExtensions'=>'pdf','maxFileSizeMB'=>10));
 $client->search('test',10);
 $policy=Wire::$body['query']['bool']['filter'];
@@ -29,7 +31,9 @@ check(Wire::$body['query']['bool']['must_not'][0]['bool']['filter']===$policy,'p
 foreach(array('failures'=>array(array('reason'=>'failed')),'timed_out'=>true,'version_conflicts'=>1)as$key=>$value){Wire::$result=array('deleted'=>1,$key=>$value);$failed=false;try{$client->purgeExcluded(10);}catch(RuntimeException $e){$failed=true;}check($failed,'incomplete purge remains retryable: '.$key);}
 $empty=new KodboxElasticClient(array('allowExtensions'=>''));Wire::$result=array('hits'=>array('hits'=>array()));$empty->search('test',10);
 check(isset(Wire::$body['query']['bool']['filter'][0]['match_none']),'empty allow list denies all results');
-$source=file_get_contents(__DIR__.'/../app.php');eval('namespace FulltextPolicyTest; '.substr($source,5));
+$source=file_get_contents(__DIR__.'/../app.php');$source=preg_replace('/require_once __DIR__[^;]+;/', '', $source);
+require_once __DIR__.'/../lib/Security.class.php';
+eval('namespace FulltextPolicyTest; '.substr($source,5));
 $dir=sys_get_temp_dir().'/fulltext-policy-test-'.getmypid();mkdir($dir);
 try {
  $r=new \ReflectionClass('FulltextPolicyTest\\elasticFulltextPlugin');$app=$r->newInstanceWithoutConstructor();$r->getProperty('cursorFile')->setValue($app,$dir.'/cursor.json');

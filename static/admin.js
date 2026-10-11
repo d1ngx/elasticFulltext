@@ -1,3 +1,15 @@
+
+(function(){
+ function install(){
+  if(!window.jQuery || window.__kodSearchRequestGuard) return;
+  window.__kodSearchRequestGuard=true;
+  jQuery.ajaxPrefilter(function(options, original, xhr){
+   var url=new URL(options.url,location.href);
+   if(url.origin===location.origin && /(?:plugin\/|plugin%2f)(?:aiRag|elasticFulltext)(?:\/|%2f)/i.test(url.href)) xhr.setRequestHeader('X-Kodbox-Plugin','1');
+  });
+ }
+ install(); if(window.kodReady) kodReady.push(install);
+})();
 kodReady.push(function(){
 	if(window.__elasticFulltextAdminReady)return;
 	window.__elasticFulltextAdminReady=true;
